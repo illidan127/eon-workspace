@@ -37,7 +37,7 @@
 ;;   M-x eon-workspace-create          创建或切换到 workspace（已知项目列表）
 ;;   M-x eon-workspace-find-file       在当前 workspace 打开文件
 ;;   M-x eon-workspace-rg              在当前 workspace ROOT 中用 rg 搜索
-;;   M-x eon-workspace-switch-to-buffer 在 workspace 私有 buffer 列表中切换
+;;   M-x eon-workspace-switch-to-buffer 在 workspace 私有 buffer 列表中切换（Marginalia + C-k kill）
 ;;   M-x eon-workspace-cleanup         清理非工作目录的文件 buffer
 ;;   M-x eon-workspace-kill            删除 workspace 并关闭其 frame
 ;;   M-x eon-workspace-list            列出所有 workspace
@@ -626,20 +626,69 @@ ROOT 是工作目录；NAME 是 workspace 名称，缺省由 ROOT 生成。
                 (cl-incf killed))))))
       (message "已清理 %d 个非工作目录 buffer" killed))))
 
+(defun eon-workspace--buffer-name-list (&optional ws)
+  "返回 WS（默认当前 workspace）私有 buffer 的名称列表。"
+  (let ((ws (or ws (eon-workspace-current))))
+    (when ws
+      (mapcar #'buffer-name (eon-workspace-buffer-list ws)))))
+
+(defun eon-workspace--buffer-list-collection (str &optional predicate _action)
+  "Ivy/`all-completions' 用的 collection，只返回当前 workspace 存活 buffer 的名称。"
+  (when-let ((names (eon-workspace--buffer-name-list)))
+    (all-completions str (lambda (_s &rest _) names) predicate)))
+
+(defun eon-workspace--ivy-kill-buffer-action (name)
+  "Kill 名为 NAME 的 buffer，并刷新 workspace 候选列表。"
+  (when (and name (not (string-empty-p name)))
+    (when-let ((buf (get-buffer name)))
+      (kill-buffer buf)))
+  (unless (buffer-live-p (ivy-state-buffer ivy-last))
+    (setf (ivy-state-buffer ivy-last)
+          (with-ivy-window (current-buffer))))
+  ;; 与 ivy--kill-current-candidate 相同：先删掉当前项，再按最新列表重建
+  (setf (ivy-state-preselect ivy-last) ivy--index)
+  (setq ivy--old-re nil)
+  (setq ivy--all-candidates
+        (cl-delete name ivy--all-candidates
+                   :key (lambda (c) (if (consp c) (car c) c))
+                   :test #'string=))
+  (setq ivy--all-candidates
+        (eon-workspace--buffer-list-collection "" nil nil))
+  (let ((ivy--recompute-index-inhibit t))
+    (ivy--exhibit)))
+
+(defvar eon-workspace-ivy-switch-buffer-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-k") #'eon-workspace-ivy-switch-buffer-kill)
+    map)
+  "eon-workspace-switch-to-buffer 的 ivy keymap。")
+
+(defun eon-workspace-ivy-switch-buffer-kill ()
+  "行末 kill 当前候选 buffer；否则 `ivy-kill-line'。"
+  (interactive)
+  (if (not (eolp))
+      (ivy-kill-line)
+    (let ((cand (ivy-state-current ivy-last)))
+      (eon-workspace--ivy-kill-buffer-action
+       (if (consp cand) (car cand) cand)))))
+
 ;;;###autoload
 (defun eon-workspace-switch-to-buffer ()
-  "在当前 workspace 的私有 buffer 列表中切换 buffer。"
+  "在当前 workspace 的私有 buffer 列表中切换 buffer。
+通过 ivy 展示候选；Marginalia 显示 major-mode 与文件路径（见 `eon-marginalia-annotate-buffer'）。
+`C-k' 在行末可 kill 当前候选 buffer。"
   (interactive)
   (let ((ws (eon-workspace-current)))
     (unless ws (user-error "当前 frame 未关联 workspace"))
-    (let* ((bufs (eon-workspace-buffer-list ws))
-           (names (mapcar #'buffer-name bufs)))
-      (unless names
-        (user-error "当前 workspace 无可切换 buffer"))
-      (switch-to-buffer
-       (completing-read
-        (format "切换 buffer (%s): " (eon-workspace-name ws))
-        names nil t)))))
+    (unless (eon-workspace-buffer-list ws)
+      (user-error "当前 workspace 无可切换 buffer"))
+    (require 'ivy)
+    (ivy-read (format "切换 buffer (%s): " (eon-workspace-name ws))
+              #'eon-workspace--buffer-list-collection
+                :keymap eon-workspace-ivy-switch-buffer-map
+                :preselect (buffer-name (other-buffer (current-buffer)))
+              :action #'ivy--switch-buffer-action
+              :caller 'ivy-switch-buffer)))
 
 ;;;###autoload
 (defun eon-workspace-kill (name)
