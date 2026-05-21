@@ -58,14 +58,20 @@
 | `eon-workspace-remove-project` | 从已知项目列表移除目录 |
 | `eon-workspace-init-config` | 在 workspace 根目录创建 `.eon.yaml`（已存在则跳过） |
 
-## 已知项目列表
+## 已知项目与最近使用
 
-路径由 `eon-workspace-projects-file` 控制，默认为：
+两个独立文件（目录默认同 `user-emacs-directory` 或 `no-littering-var-directory`）：
 
-- 已加载 `no-littering` → `no-littering-var-directory/eon-workspace-projects.el`
-- 否则 → `user-emacs-directory/eon-workspace-projects.el`
+| 文件 | 作用 |
+|------|------|
+| `eon-workspace-projects.el` | 已知项目固定集合，仅 `add-project` / `remove-project` 增删，顺序稳定 |
+| `eon-workspace-recent.el` | F8 列表的 MRU 顺序，每次切换/创建 workspace 时更新 |
 
-创建 workspace **不会**自动把目录写入该列表，需手动 `eon-workspace-add-project`。
+加载 `projects` 时会自动去重并写回。首次无 `recent` 文件时，用当前 `projects` 顺序初始化。
+
+创建 workspace **不会**自动加入 `projects`，需 `eon-workspace-add-project`；切换/创建会更新 `recent`。
+
+路径：`eon-workspace-projects-file`、`eon-workspace-recent-file`（均为 nil 时自动选择上述默认路径）。
 
 ## `.eon.yaml`
 
@@ -86,6 +92,7 @@ ignore-patterns:
 | 变量 | 说明 |
 |------|------|
 | `eon-workspace-projects-file` | 已知项目列表文件路径 |
+| `eon-workspace-recent-file` | 最近使用顺序文件路径 |
 | `eon-workspace-config-file` | 配置文件名（默认 `.eon.yaml`） |
 | `eon-workspace-fd-executable` | `fd` 可执行文件（默认 `fd`） |
 | `eon-workspace-open-dired-on-create` | 创建后是否打开 dired |
@@ -98,7 +105,7 @@ ignore-patterns:
 | | perspective | eon-workspace |
 |---|-------------|---------------|
 | 隔离单位 | 同一 frame 内 perspective | 每个 workspace 一个 frame |
-| 项目列表 | 随 perspective 状态 | 独立 `eon-workspace-projects.el` |
+| 项目列表 | 随 perspective 状态 | `projects.el` + `recent.el` |
 | 根目录 | 可随项目变化 | 创建后固定 |
 | 找文件 / rg | projectile 体系 | `fd` + `.eon.yaml`，`counsel-rg` |
 
