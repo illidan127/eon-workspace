@@ -8,7 +8,7 @@
 - **固定根目录**：创建时绑定 `root`，之后不可修改
 - **创建即切换**：`eon-workspace-create` 从已知项目列表选择；已打开则切换 frame，未打开则新建
 - **Buffer 隔离**：`eon-workspace-buffer-isolation-mode` 通过 `buffer-predicate` 与 `read-buffer-function` 限制各 workspace 可见 buffer
-- **项目内找文件**：`eon-workspace-find-file` 用 `fd` 列出文件，遵守 `.gitignore`，并叠加 `.eon.yaml` 忽略规则
+- **项目内找文件**：`eon-workspace-find-file` 用 `fd` 列出文件，Ivy 选择（支持 `ivy-occur`），遵守 `.gitignore`，并叠加 `.eon.yaml` 忽略规则
 - **项目内搜索**：`eon-workspace-rg` 在当前 workspace 根目录执行 `counsel-rg`
 - **清理**：`eon-workspace-cleanup` 关闭当前 workspace 中位于根目录之外的文件 buffer
 
@@ -18,6 +18,7 @@
 |------|------|
 | Emacs ≥ 27.1 | `window-buffer-change-functions` 等 API |
 | [fd](https://github.com/sharkdp/fd) | `eon-workspace-find-file` 列文件 |
+| [ivy](https://github.com/abo-abo/swiper) | `eon-workspace-find-file`、`eon-workspace-switch-to-buffer`（调用时 `require`） |
 | [counsel](https://github.com/abo-abo/swiper) | `eon-workspace-rg`（可选，调用时 `require`） |
 | [ripgrep](https://github.com/BurntSushi/ripgrep) | `eon-workspace-rg` 后端 |
 

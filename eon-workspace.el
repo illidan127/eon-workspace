@@ -20,7 +20,8 @@
 ;;     通过 frame 的 buffer-predicate 与 read-buffer-function 两层机制，
 ;;     做到 workspace 间 buffer 列表互相隔离。同一文件被多个 workspace
 ;;     打开时仍是同一 buffer，可同时归属多个 workspace 的私有列表
-;;   - eon-workspace-find-file 通过 fd 列出 ROOT 下文件并补全选择，
+;;   - eon-workspace-find-file 通过 fd 列出 ROOT 下文件，ivy 补全选择
+;;     （支持 ivy-occur 等 ivy-read 能力），
 ;;     遵守 .gitignore，并叠加 ROOT/.eon.yaml 中
 ;;     ignore-patterns: 配置的额外过滤模式
 ;;   - 提供清理命令，清理当前 workspace 中非工作目录文件对应的 buffer，
@@ -703,7 +704,7 @@ ROOT 是工作目录；NAME 是 workspace 名称，缺省由 ROOT 生成。
   "在当前 workspace 中打开文件。
 若当前 frame 已关联 workspace，则用 fd 列出 ROOT 下的所有文件
 （自动遵守 .gitignore，并叠加 `.eon.yaml' 中 ignore-patterns 配置
-的过滤），通过 `completing-read' 选择。
+的过滤），通过 `ivy-read' 选择（支持 `ivy-occur' 等）。
 否则回退到普通的 `find-file'。"
   (interactive)
   (let ((ws (eon-workspace-current)))
@@ -713,12 +714,13 @@ ROOT 是工作目录；NAME 是 workspace 名称，缺省由 ROOT 生成。
              (files (eon-workspace--list-project-files root)))
         (unless files
           (user-error "%s 下没有匹配的文件" root))
-        (let* ((rel (completing-read
-                     (format "打开文件 (%s): "
-                             (eon-workspace-name ws))
-                     files nil t))
-               (full (expand-file-name rel root)))
-          (find-file full))))))
+        (require 'ivy)
+        (ivy-read (format "打开文件 (%s): "
+                          (eon-workspace-name ws))
+                  files
+                  :action (lambda (rel)
+                            (find-file (expand-file-name rel root)))
+                  :caller 'eon-workspace-find-file)))))
 
 ;;;###autoload
 (defun eon-workspace-rg (&optional options)
