@@ -44,18 +44,11 @@
 ;;   M-x eon-workspace-add-project     手工把目录加入已知项目列表
 ;;   M-x eon-workspace-remove-project  从已知项目列表中移除
 ;;   M-x eon-workspace-init-config     在当前 workspace 根目录创建 .eon.yaml
-;;   M-x eon-workspace-switch-to-blocked-agent-shell
-;;                                     切换到第一个等待授权的 agent-shell
 
 ;;; Code:
 
 (require 'cl-lib)
 (require 'seq)
-
-(declare-function agent-shell-buffers "agent-shell")
-(declare-function agent-shell-status "agent-shell")
-(declare-function agent-shell--permission-pending-p "agent-shell")
-(declare-function shell-maker-busy "shell-maker")
 
 (defgroup eon-workspace nil
   "Frame-based workspaces with bound working directories."
@@ -599,69 +592,6 @@ CANCELLABLE 非 nil 时（用户主动调用 `eon-workspace-kill'），
         (string-prefix-p " " name)
         (string-prefix-p "*" name))))
 
-
-;;;; agent-shell
-
-(defun eon-workspace--agent-shell-buffers ()
-  "返回全部 agent-shell buffer；优先 `agent-shell-buffers'。"
-  (if (fboundp 'agent-shell-buffers)
-      (agent-shell-buffers)
-    (seq-filter (lambda (buf)
-                  (with-current-buffer buf
-                    (derived-mode-p 'agent-shell-mode)))
-                (buffer-list))))
-
-(defun eon-workspace--agent-shell-permission-pending-p ()
-  "当前 buffer 是否有待处理的 permission 请求。"
-  (cond
-   ((fboundp 'agent-shell--permission-pending-p)
-    (agent-shell--permission-pending-p))
-   ((and (boundp 'agent-shell--state)
-         (map-elt agent-shell--state :tool-calls))
-    (seq-some (lambda (entry)
-                (map-elt (cdr entry) :permission-request-id))
-              (map-elt agent-shell--state :tool-calls)))
-   (t nil)))
-
-(defun eon-workspace--agent-shell-buffer-blocked-p (buf)
-  "BUF 是否在等待用户授权（与 `agent-shell-status' 的 `blocked' 等价）。"
-  (with-current-buffer buf
-    (unless (derived-mode-p 'agent-shell-mode)
-      (cl-return nil))
-    (cond
-     ((fboundp 'agent-shell-status)
-      (eq 'blocked (agent-shell-status :shell-buffer buf)))
-     (t
-      (and (eon-workspace--agent-shell-permission-pending-p)
-           (or (not (fboundp 'shell-maker-busy))
-                (shell-maker-busy)))))))
-
-(defun eon-workspace--first-blocked-agent-shell-buffer ()
-  "返回第一个等待授权的 agent-shell buffer；无则 nil。"
-  (seq-find #'eon-workspace--agent-shell-buffer-blocked-p
-            (eon-workspace--agent-shell-buffers)))
-
-(defun eon-workspace--switch-to-buffer-in-any-frame (buf)
-  "在任意 frame 中显示 BUF；若已在某窗口显示则切到该 frame/window。"
-  (let ((win (get-buffer-window buf 'visible)))
-    (if win
-        (progn
-          (select-frame-set-input-focus (window-frame win))
-          (select-window win))
-      (switch-to-buffer buf))))
-
-;;;###autoload
-(defun eon-workspace-switch-to-blocked-agent-shell ()
-  "切换到第一个等待用户授权（permission）的 agent-shell buffer。
-遍历当前 Emacs 中全部 agent-shell 实例。
-若无等待授权的 shell，则报错。"
-  (interactive)
-  (require 'agent-shell)
-  (if-let ((buf (eon-workspace--first-blocked-agent-shell-buffer)))
-      (progn
-        (eon-workspace--switch-to-buffer-in-any-frame buf)
-        (message "已切换到等待授权的 agent-shell: %s" (buffer-name buf)))
-    (user-error "没有等待用户授权的 agent-shell")))
 
 ;;;; 命令
 
