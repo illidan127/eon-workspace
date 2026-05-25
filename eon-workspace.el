@@ -198,16 +198,17 @@ minibuffer、名字以空格开头的 internal buffer、*scratch*、*Messages*�
   "返回当前 frame 对应的 workspace，未关联返回 nil。"
   (eon-workspace--find-by-frame (selected-frame)))
 
-(defun eon-workspace--names ()
-  "返回所有存活 workspace 名称。"
+(defun eon-workspace--read-workspace (prompt &optional mark-open)
+  "用 PROMPT 让用户选择一个 workspace，返回其 ROOT 绝对路径。
+显示格式与 `eon-workspace--read-project' 一致（~ 前缀、重名时 〔basename〕）。
+MARK-OPEN 非 nil 时，对已打开项标注 〔已打开〕。"
   (eon-workspace--cleanup-dead)
-  (mapcar #'eon-workspace-name eon-workspace--list))
-
-(defun eon-workspace--read-name (prompt)
-  "用 PROMPT 让用户选择一个已存在 workspace 名称。"
-  (let ((names (eon-workspace--names)))
-    (unless names (user-error "尚无任何 workspace"))
-    (completing-read prompt names nil t)))
+  (unless eon-workspace--list (user-error "尚无任何 workspace"))
+  (let* ((roots (mapcar #'eon-workspace-root eon-workspace--list))
+         (pairs (eon-workspace--project-display-pairs roots mark-open))
+         (choices (mapcar #'car pairs))
+         (selected (completing-read prompt choices nil t)))
+    (cdr (assoc-string selected pairs))))
 
 (defun eon-workspace--file-in-root-p (file root)
   "判断 FILE 是否在 ROOT 目录之下。"
@@ -346,20 +347,31 @@ minibuffer、名字以空格开头的 internal buffer、*scratch*、*Messages*�
       (eon-workspace--save-projects))
     (eon-workspace--touch-project d)))
 
-(defun eon-workspace--project-display-pairs (dirs)
-  "为 DIRS 生成 (显示名 . 绝对路径) 列表；显示名冲突时附带目录 basename 区分。"
+(defun eon-workspace--project-open-p (dir)
+  "DIR 是否已绑定存活 workspace（有对应 frame）。
+调用前需已执行 `eon-workspace--cleanup-dead'。"
+  (let ((ws (eon-workspace--find-by-root dir)))
+    (and ws (eon-workspace--alive-p ws))))
+
+(defun eon-workspace--project-display-pairs (dirs &optional mark-open)
+  "为 DIRS 生成 (显示名 . 绝对路径) 列表；显示名冲突时附带目录 basename 区分。
+MARK-OPEN 非 nil 时，对已绑定且 frame 存活的工作区在显示名后标注 〔已打开〕。"
+  (when mark-open (eon-workspace--cleanup-dead))
   (let ((paths (eon-workspace--dedupe-dirs dirs))
         (abbr-count (make-hash-table :test 'equal)))
     (mapcar
      (lambda (p)
        (let* ((abbr (eon-workspace--abbreviate-dir p))
-              (n (gethash abbr abbr-count 0)))
+              (n (gethash abbr abbr-count 0))
+              (label (if (> n 0)
+                         (format "%s 〔%s〕" abbr
+                                 (file-name-nondirectory
+                                  (directory-file-name p)))
+                       abbr)))
          (puthash abbr (1+ n) abbr-count)
-         (cons (if (> n 0)
-                   (format "%s 〔%s〕" abbr
-                           (file-name-nondirectory
-                            (directory-file-name p)))
-                 abbr)
+         (cons (if (and mark-open (eon-workspace--project-open-p p))
+                   (format "%s  〔已打开〕" label)
+                 label)
                p)))
      paths)))
 
@@ -391,7 +403,7 @@ minibuffer、名字以空格开头的 internal buffer、*scratch*、*Messages*�
 列表中以 ~ 代替 HOME 前缀显示，选中后返回绝对路径。"
   (let ((candidates (eon-workspace--known-projects)))
     (if candidates
-        (let* ((pairs (eon-workspace--project-display-pairs candidates))
+        (let* ((pairs (eon-workspace--project-display-pairs candidates t))
                (choices (mapcar #'car pairs))
                (selected (completing-read "选择工作区: "
                                           choices nil t)))
@@ -815,24 +827,29 @@ ROOT 是工作目录；NAME 是 workspace 名称，缺省由 ROOT 生成。
               :caller 'ivy-switch-buffer)))
 
 ;;;###autoload
-(defun eon-workspace-kill (name)
-  "删除名为 NAME 的 workspace，并关闭其 frame。
+(defun eon-workspace-kill (&optional root)
+  "删除 ROOT 对应 workspace，并关闭其 frame。
+ROOT 为工作目录绝对路径；交互选择与 `eon-workspace-create' 相同的路径展示形式。
 删除前会逐一处理私有 buffer 的未保存内容（提示保存或 kill anyway）。
 若用户在某一步取消，整个流程中止，frame 与 workspace 都不会被删。"
-  (interactive (list (eon-workspace--read-name "删除 workspace: ")))
-  (let ((ws (eon-workspace--find-by-name name)))
-    (unless ws (user-error "未找到 workspace: %s" name))
+  (interactive (list (eon-workspace--read-workspace "删除 workspace: ")))
+  (let ((ws (eon-workspace--find-by-root root))
+        (label (eon-workspace--abbreviate-dir root)))
+    (unless ws (user-error "未找到 workspace: %s" root))
     (when (or (not eon-workspace-confirm-kill)
-              (yes-or-no-p (format "确认删除 workspace %s? " name)))
+              (yes-or-no-p (format "确认删除 workspace %s (%s)? "
+                                   (eon-workspace-name ws) label)))
       (if (not (eon-workspace--kill-private-buffers ws t))
-          (message "已取消删除 workspace: %s" name)
+          (message "已取消删除 workspace: %s (%s)"
+                   (eon-workspace-name ws) label)
         (let ((frame (eon-workspace-frame ws)))
           ;; 先从列表移除，避免 delete-frame 钩子再次进入 buffer 清理流程
           (setq eon-workspace--list (delq ws eon-workspace--list))
           (when (frame-live-p frame)
             (delete-frame frame t)))
         (run-hooks 'eon-workspace-kill-hook)
-        (message "已删除 workspace: %s" name)))))
+        (message "已删除 workspace: %s (%s)"
+                 (eon-workspace-name ws) label)))))
 
 ;;;###autoload
 (defun eon-workspace-list ()
