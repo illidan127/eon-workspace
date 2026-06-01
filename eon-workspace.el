@@ -45,6 +45,8 @@
 ;;   M-x eon-workspace-add-project     手工把目录加入已知项目列表
 ;;   M-x eon-workspace-remove-project  从已知项目列表中移除
 ;;   M-x eon-workspace-init-config     在当前 workspace 根目录创建 .eon.yaml
+;;   M-x eon-workspace-config           用 customize 风格界面编辑 .eon.yaml
+;;   M-x eon-workspace-compile          执行 .eon.yaml 中配置的 compile 命令
 
 ;;; Code:
 
@@ -94,6 +96,12 @@ eon-workspace-recent.el。"
 
 (defcustom eon-workspace-ignore-patterns-key "ignore-patterns"
   ".eon.yaml 中表示忽略模式列表的顶层 key 名。"
+  :type 'string
+  :group 'eon-workspace)
+
+(defcustom eon-workspace-compile-key "compile"
+  ".eon.yaml 中表示 compile 命令的顶层 key 名。
+对应的值应为多行 shell 命令，支持 YAML 块字符串格式（| 或 >）。"
   :type 'string
   :group 'eon-workspace)
 
@@ -439,10 +447,47 @@ MARK-OPEN 非 nil 时，对已绑定且 frame 存活的工作区在显示名后�
             (forward-line 1)))
         (nreverse results)))))
 
+(defun eon-workspace--parse-yaml-block-string (file key)
+  "从 FILE 中提取 yaml 顶层 KEY 对应的多行块字符串值。
+识别如下 YAML 块字符串格式（| 或 >）：
+
+    key: |
+      第一行
+      第二行
+
+返回去缩进后的多行文本，失败返回 nil。"
+  (when (and file (file-readable-p file))
+    (with-temp-buffer
+      (insert-file-contents file)
+      (goto-char (point-min))
+      (let ((header (format "^%s[ \t]*:[ \t]*[|>]?[ \t]*$"
+                            (regexp-quote key)))
+            lines base-indent)
+        (when (re-search-forward header nil t)
+          (forward-line 1)
+          (while (and (not (eobp))
+                      (looking-at "^\\([ \t]+\\)\\(.*\\)$"))
+            (let ((indent (length (match-string 1)))
+                  (content (match-string 2)))
+              (unless base-indent
+                (setq base-indent indent))
+              (push (substring (concat (match-string 1) content)
+                               base-indent)
+                    lines))
+            (forward-line 1)))
+        (if lines
+            (string-trim-right (string-join (nreverse lines) "\n"))
+          nil)))))
+
 (defun eon-workspace--ignore-patterns (root)
   "读取 ROOT 下 `eon-workspace-config-file' 的忽略模式列表。"
   (let ((file (expand-file-name eon-workspace-config-file root)))
     (eon-workspace--parse-yaml-list file eon-workspace-ignore-patterns-key)))
+
+(defun eon-workspace--compile-command (root)
+  "读取 ROOT 下 `eon-workspace-config-file' 配置的 compile 命令。"
+  (let ((file (expand-file-name eon-workspace-config-file root)))
+    (eon-workspace--parse-yaml-block-string file eon-workspace-compile-key)))
 
 (defun eon-workspace--rg-ignored-globs (root)
   "从 ROOT 的 .eon.yaml ignore-patterns 生成 rg 的 --glob ! 参数串。"
@@ -672,8 +717,209 @@ ROOT 是工作目录；NAME 是 workspace 名称，缺省由 ROOT 生成。
           (insert "# ignore-patterns: 列表中的每项作为 -E 参数传给 fd，用于\n")
           (insert "# 过滤 eon-workspace-find-file 的候选文件。\n\n")
           (insert (format "%s:\n" eon-workspace-ignore-patterns-key))
-          (insert "  - \".git\"\n"))
+          (insert "  - \".git\"\n")
+          (insert "\n")
+          (insert (format "# %s: 编译命令（多行 shell 脚本），\n"
+                          eon-workspace-compile-key))
+          (insert "# 执行时以 workspace 根目录作为工作目录。\n")
+          (insert "# 支持 YAML 块字符串格式（| 或 >）。\n")
+          (insert (format "#%s: |\n" eon-workspace-compile-key))
+          (insert "#   echo \"TODO: 配置编译命令\"\n"))
         (message "已创建 %s" file)))))
+
+;;;###autoload
+(defun eon-workspace-compile ()
+  "执行当前 workspace 的 .eon.yaml 中配置的 compile 命令。
+compile 的值应为多行 shell 命令，支持 YAML 块字符串格式（| 或 >）。
+编译输出显示在 *compilation-<workspace>* buffer 中。"
+  (interactive)
+  (let ((ws (eon-workspace-current)))
+    (unless ws (user-error "当前 frame 未关联 workspace"))
+    (let* ((root (eon-workspace-root ws))
+           (cmd (eon-workspace--compile-command root)))
+      (unless cmd
+        (user-error "%s 中未配置 compile 命令"
+                    (expand-file-name eon-workspace-config-file root)))
+      (require 'compile)
+      (let ((default-directory root))
+        (compilation-start
+         cmd nil
+         (lambda (_)
+           (format "*compilation-%s*" (eon-workspace-name ws))))))))
+
+
+;;;; 配置界面 (customize-like)
+
+(defvar-local eon-workspace-config--editable-list nil
+  "Buffer-local reference to the editable-list widget.")
+
+(defvar-local eon-workspace-config--compile-widget nil
+  "Buffer-local reference to the compile text widget.")
+
+(defvar-local eon-workspace-config--config-file nil
+  "Buffer-local path to the .eon.yaml being edited.")
+
+(defun eon-workspace-config--write-yaml (file patterns compile-cmd)
+  "Write PATTERNS and COMPILE-CMD to FILE in .eon.yaml format."
+  (let ((filtered (seq-remove #'string-empty-p patterns)))
+    (with-temp-file file
+      (insert (format "# eon-workspace 配置文件\n"))
+      (insert (format "# %s: 列表中的每项作为 -E 参数传给 fd，用于过滤文件。\n\n"
+                      eon-workspace-ignore-patterns-key))
+      (insert (format "%s:\n" eon-workspace-ignore-patterns-key))
+      (if filtered
+          (dolist (p filtered)
+            (insert (format "  - \"%s\"\n" p)))
+        (insert "  []\n"))
+      (when (and compile-cmd (not (string-empty-p compile-cmd)))
+        (insert "\n")
+        (insert (format "%s: |\n" eon-workspace-compile-key))
+        (dolist (line (split-string compile-cmd "\n"))
+          (insert (format "  %s\n" line)))))))
+
+(defun eon-workspace-config--save ()
+  "Read widget values and write them to .eon.yaml."
+  (interactive)
+  (if (and eon-workspace-config--editable-list
+           eon-workspace-config--compile-widget)
+      (let ((patterns (widget-value eon-workspace-config--editable-list))
+            (compile-cmd (widget-value eon-workspace-config--compile-widget)))
+        (eon-workspace-config--write-yaml eon-workspace-config--config-file
+                                          patterns compile-cmd)
+        (message "已保存到 %s" eon-workspace-config--config-file))
+    (user-error "找不到配置 widget")))
+
+(defun eon-workspace-config--revert ()
+  "Reload config from .eon.yaml and refresh the widget buffer."
+  (interactive)
+  (when eon-workspace-config--config-file
+    (let* ((root (file-name-directory eon-workspace-config--config-file))
+           (patterns (eon-workspace--ignore-patterns root))
+           (compile-cmd (eon-workspace--compile-command root)))
+      (with-current-buffer (get-buffer-create "*Eon Config*")
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (remove-overlays)
+          (setq eon-workspace-config--editable-list nil)
+          (setq eon-workspace-config--compile-widget nil)
+          (widget-insert (propertize
+                          (format "配置文件: %s\n\n"
+                                  eon-workspace-config--config-file)
+                          'face 'bold))
+          (widget-insert (propertize
+                          (format "%s:\n" eon-workspace-ignore-patterns-key)
+                          'face 'widget-documentation-face))
+          (widget-insert
+           "  作为 fd -E / rg --glob ! 参数叠加，用于排除文件。\n\n")
+          (setq eon-workspace-config--editable-list
+                (widget-create
+                 'editable-list
+                 :entry-format "%i %d %v"
+                 :insert-button-args '(:tag "新增")
+                 :delete-button-args '(:tag "删除")
+                 :append-button-args '(:tag "新增")
+                 :value (or patterns '())
+                 :indent 2
+                 '(editable-field :format "%v")))
+          (widget-insert "\n")
+          (widget-insert (propertize
+                          (format "%s:\n" eon-workspace-compile-key)
+                          'face 'widget-documentation-face))
+          (widget-insert
+           "  编译命令，多行 shell 脚本（将 workspace 根目录作为工作目录执行）。\n\n")
+          (setq eon-workspace-config--compile-widget
+                (widget-create 'text
+                               :value (or compile-cmd "")
+                               :indent 2
+                               :size 4))
+          (widget-insert "\n")
+          (widget-create 'push-button
+                         :notify (lambda (&rest _) (eon-workspace-config--save))
+                         "保存")
+          (widget-insert "  ")
+          (widget-create 'push-button
+                         :notify (lambda (&rest _) (eon-workspace-config--revert))
+                         "还原")
+          (widget-insert "  ")
+          (widget-create 'push-button
+                         :notify (lambda (&rest _) (quit-window))
+                         "退出")
+          (widget-setup)
+          (widget-forward 1)))
+      (message "配置已还原"))))
+
+;;;###autoload
+(defun eon-workspace-config ()
+  "用 customize 风格界面编辑当前 workspace 的 .eon.yaml 配置。
+在 *Eon Config* buffer 中以 widget 形式展示忽略模式列表和 compile 命令，
+每个忽略模式可独立编辑、新增或删除。提供保存 (C-c C-s)、
+还原 (C-c C-k)、退出 (q) 按钮与快捷键。"
+  (interactive)
+  (require 'wid-edit)
+  (let ((ws (eon-workspace-current)))
+    (unless ws (user-error "当前 frame 未关联 workspace"))
+    (let* ((root (eon-workspace-root ws))
+           (config-file (expand-file-name eon-workspace-config-file root))
+           (patterns (eon-workspace--ignore-patterns root))
+           (compile-cmd (eon-workspace--compile-command root))
+           (buf (get-buffer-create "*Eon Config*")))
+      (pop-to-buffer buf)
+      (with-current-buffer buf
+        (let ((inhibit-read-only t))
+          (erase-buffer))
+        (remove-overlays)
+        (setq eon-workspace-config--editable-list nil)
+        (setq eon-workspace-config--compile-widget nil)
+        (setq eon-workspace-config--config-file config-file)
+        (widget-insert (propertize
+                        (format "配置文件: %s\n\n" config-file)
+                        'face 'bold))
+        (widget-insert (propertize
+                        (format "%s:\n" eon-workspace-ignore-patterns-key)
+                        'face 'widget-documentation-face))
+        (widget-insert
+         "  作为 fd -E / rg --glob ! 参数叠加，用于排除文件。\n\n")
+        (setq eon-workspace-config--editable-list
+              (widget-create
+               'editable-list
+               :entry-format "%i %d %v"
+               :insert-button-args '(:tag "新增")
+               :delete-button-args '(:tag "删除")
+               :append-button-args '(:tag "新增")
+               :value (or patterns '())
+               :indent 2
+               '(editable-field :format "%v")))
+        (widget-insert "\n")
+        (widget-insert (propertize
+                        (format "%s:\n" eon-workspace-compile-key)
+                        'face 'widget-documentation-face))
+        (widget-insert
+         "  编译命令，多行 shell 脚本（将 workspace 根目录作为工作目录执行）。\n\n")
+        (setq eon-workspace-config--compile-widget
+              (widget-create 'text
+                             :value (or compile-cmd "")
+                             :indent 2
+                             :size 4))
+        (widget-insert "\n")
+        (widget-create 'push-button
+                       :notify (lambda (&rest _) (eon-workspace-config--save))
+                       "保存")
+        (widget-insert "  ")
+        (widget-create 'push-button
+                       :notify (lambda (&rest _) (eon-workspace-config--revert))
+                       "还原")
+        (widget-insert "  ")
+        (widget-create 'push-button
+                       :notify (lambda (&rest _) (quit-window))
+                       "退出")
+        (use-local-map (copy-keymap widget-keymap))
+        (local-set-key (kbd "C-c C-s") #'eon-workspace-config--save)
+        (local-set-key (kbd "C-c C-k") #'eon-workspace-config--revert)
+        (local-set-key (kbd "q") #'quit-window)
+        (widget-setup)
+        (goto-char (point-min))
+        (widget-forward 1)))))
+
 
 ;;;###autoload
 (defun eon-workspace-add-project (dir)
