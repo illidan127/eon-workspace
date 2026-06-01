@@ -37,6 +37,7 @@
 ;; 主要命令：
 ;;   M-x eon-workspace-create          创建或切换到 workspace（已知项目列表）
 ;;   M-x eon-workspace-find-file       在当前 workspace 打开文件
+;;   M-x eon-workspace-open             从任意 workspace 选择文件打开（不切换工作区）
 ;;   M-x eon-workspace-rg              在当前 workspace ROOT 中用 rg 搜索
 ;;   M-x eon-workspace-switch-to-buffer 在 workspace 私有 buffer 列表中切换（Marginalia + C-k kill）
 ;;   M-x eon-workspace-cleanup         清理非工作目录的文件 buffer
@@ -967,6 +968,24 @@ compile 的值应为多行 shell 命令，支持 YAML 块字符串格式（| 或
                   :action (lambda (rel)
                             (find-file (expand-file-name rel root)))
                   :caller 'eon-workspace-find-file)))))
+
+;;;###autoload
+(defun eon-workspace-open ()
+  "从已有 workspace 列表中选择工作区，列出其文件并打开。
+不同于 `eon-workspace-find-file'（仅限当前工作区），
+可打开其他 workspace 的文件而不切换工作区。"
+  (interactive)
+  (let* ((root (eon-workspace--read-workspace "选择工作区: " t))
+         (files (eon-workspace--list-project-files root)))
+    (unless files
+      (user-error "%s 下没有匹配的文件" root))
+    (require 'ivy)
+    (ivy-read (format "打开文件 (%s): "
+                      (directory-file-name root))
+              files
+              :action (lambda (rel)
+                        (find-file (expand-file-name rel root)))
+              :caller 'eon-workspace-open)))
 
 ;;;###autoload
 (defun eon-workspace-rg (&optional options)
