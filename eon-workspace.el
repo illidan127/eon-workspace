@@ -32,7 +32,11 @@
 ;;   ignore-patterns:
 ;;     - "*.log"
 ;;     - "dist"
-;;     - "node_modules"
+;;   action:
+;;     compile: |
+;;       echo "building..."
+;;     test: |
+;;       pytest -v
 ;;
 ;; 主要命令：
 ;;   M-x eon-workspace-create          创建或切换到 workspace（已知项目列表）
@@ -47,7 +51,9 @@
 ;;   M-x eon-workspace-remove-project  从已知项目列表中移除
 ;;   M-x eon-workspace-init-config     在当前 workspace 根目录创建 .eon.yaml
 ;;   M-x eon-workspace-config           用 customize 风格界面编辑 .eon.yaml
-;;   M-x eon-workspace-compile          执行 .eon.yaml 中配置的 compile 命令
+;;   M-x eon-workspace-compile          执行 compile 命令（向后兼容，推荐 action.compile）
+;;   M-x eon-workspace-action            从 .eon.yaml 中选择并执行 action
+;;   M-x eon-workspace-format            格式化 .eon.yaml 中 exec 块（eon-workspace-format.el）
 
 ;;; Code:
 
@@ -102,7 +108,15 @@ eon-workspace-recent.el。"
 
 (defcustom eon-workspace-compile-key "compile"
   ".eon.yaml 中表示 compile 命令的顶层 key 名。
-对应的值应为多行 shell 命令，支持 YAML 块字符串格式（| 或 >）。"
+对应的值应为多行 shell 命令，支持 YAML 块字符串格式（| 或 >）。
+注意：此顶层 key 已废弃，推荐使用 action 子树下的 compile 子节点。"
+  :type 'string
+  :group 'eon-workspace)
+
+(defcustom eon-workspace-action-key "action"
+  ".eon.yaml 中表示 action 子树的顶层 key 名。
+action 子树下的每个子 key 对应一个可自由配置的 shell 命令，
+可通过 `M-x eon-workspace-action' 或 `M-x eon-workspace-action-<name>' 执行。"
   :type 'string
   :group 'eon-workspace)
 
@@ -507,15 +521,287 @@ MARK-OPEN 非 nil 时，对已绑定且 frame 存活的工作区在显示名后�
             (string-trim-right (string-join (nreverse lines) "\n"))
           nil)))))
 
+(defun eon-workspace--parse-yaml-action-map (file)
+  "从 FILE 中解析 `eon-workspace-action-key' 子树下的子命令。
+返回 ((NAME . COMMAND) ...) 的 alist。
+NAME 是 action 名称，COMMAND 是对应的 shell 命令字符串。
+
+识别的 YAML 格式：
+
+  action:
+    compile: |
+      echo building...
+    test: |
+      pytest -v
+
+支持 YAML 块字符串（| 或 >）。"
+  (when (and file (file-readable-p file))
+    (with-temp-buffer
+      (insert-file-contents file)
+      (goto-char (point-min))
+      (let ((header (format "^%s:[ \t]*$"
+                            (regexp-quote eon-workspace-action-key))))
+        (when (re-search-forward header nil t)
+          (forward-line 1)
+          (let (results sub-indent)
+            (while (and (not (eobp)) (looking-at "^[ \t]*$"))
+              (forward-line 1))
+            (when (looking-at "^\\([ \t]+\\)")
+              (setq sub-indent (length (match-string 1)))
+              (goto-char (line-beginning-position)))
+            (while (and (not (eobp))
+                        (looking-at
+                         (format "^\\([ \t]\\{%d,\\}\\)\\([^: \t]+\\):[ \t]*\\([|>]\\)?[ \t]*$"
+                                 (or sub-indent 0))))
+              (let* ((indent (length (match-string 1)))
+                     (name (string-trim (match-string 2)))
+                     (lines nil)
+                     (base-indent nil))
+                (unless sub-indent (setq sub-indent indent))
+                (forward-line 1)
+                (while (and (not (eobp))
+                            (looking-at "^\\([ \t]+\\)\\([^\n]*\\)$"))
+                  (let ((line-indent (length (match-string 1)))
+                        (content (match-string 2)))
+                    (unless base-indent (setq base-indent line-indent))
+                    (when (>= line-indent base-indent)
+                      (push (substring
+                             (concat (match-string 1) content)
+                             base-indent)
+                            lines)))
+                  (forward-line 1))
+                (when lines
+                  (push (cons name (string-join (nreverse lines) "\n"))
+                        results))
+                (while (and (not (eobp)) (looking-at "^[ \t]*$"))
+                  (forward-line 1))))
+            (nreverse results)))))))
+
+;;; 结构化 action 解析（exec / ssh-exec 嵌套）
+
+(defun eon-workspace--yaml-skip-blanks ()
+  "跳过空白行，停在第一个非空白行或 EOF。"
+  (while (and (not (eobp)) (looking-at "^[ \t]*$"))
+    (forward-line 1)))
+
+(defun eon-workspace--yaml-peek-indent ()
+  "返回下一非空白行的缩进列数，EOF 时返回 nil。"
+  (save-excursion
+    (eon-workspace--yaml-skip-blanks)
+    (when (looking-at "^\\([ \t]+\\)")
+      (length (match-string 1)))))
+
+(defun eon-workspace--yaml-parse-block (parent-indent)
+  "解析 YAML 块字符串内容。PARENT-INDENT 是父 key 的缩进列数。
+point 应在第一条内容行。返回去缩进后的多行字符串。
+遇到缩进 <= PARENT-INDENT 的行或 EOF 时停止。"
+  (let ((lines nil)
+        (content-indent nil))
+    (while (and (not (eobp))
+                (looking-at (format "^\\([ \t]\\{%d,\\}\\)\\(.+\\)$"
+                                   (1+ parent-indent))))
+      (let* ((line-indent (length (match-string 1)))
+             (content (match-string 2)))
+        (unless content-indent
+          (setq content-indent line-indent))
+        (push (substring (concat (match-string 1) content)
+                         content-indent)
+              lines)
+        (forward-line 1)))
+    (when lines
+      (string-trim-right (string-join (nreverse lines) "\n")))))
+
+(defun eon-workspace--yaml-parse-map (indent)
+  "从 point 开始递归解析一个缩进为 INDENT 的 YAML map。
+返回 alist ((KEY . VALUE) ...)。
+VALUE 为字符串（块/行内值）或嵌套 alist（子 map）。
+当遇到缩进 < INDENT 的非空白行或 EOF 时停止。"
+  (let ((results nil)
+        (kv-re (format
+                "^\\([ \t]\\{%d\\}\\)\\([^: \t][^:\n]*\\):[ \t]*\\([|>]\\)?[ \t]*\\(.*\\)$"
+                indent)))
+    (catch 'done
+      (while t
+        (eon-workspace--yaml-skip-blanks)
+        (when (eobp) (throw 'done nil))
+        (let ((cur (eon-workspace--yaml-peek-indent)))
+          (unless (and cur (>= cur indent))
+            (throw 'done nil)))
+        (when (looking-at kv-re)
+          (let* ((key (string-trim (match-string 2)))
+                 (block-char (match-string 3))
+                 (inline-val (string-trim (match-string 4)))
+                 (key-indent (length (match-string 1))))
+            (forward-line 1)
+            (cond
+             ;; 块字符串（| 或 >）
+             (block-char
+              (let ((content (eon-workspace--yaml-parse-block key-indent)))
+                (push (cons key (or content "")) results)))
+             ;; 行内值
+             ((not (string-empty-p inline-val))
+              (push (cons key inline-val) results))
+             ;; 空值 → 检查是否嵌套 map
+             (t
+              (let ((next-indent (eon-workspace--yaml-peek-indent)))
+                (if (and next-indent (> next-indent key-indent))
+                    (push (cons key
+                                (eon-workspace--yaml-parse-map next-indent))
+                          results)
+                  (push (cons key "") results)))))))))
+    (nreverse results)))
+
+(defun eon-workspace--yaml-parse-list (indent)
+  "从 point 开始解析一个 YAML 序列（list），序列项缩进为 INDENT。
+每项格式为 \"- key: ...\"，其中 key 可以是 exec（块/行内）或 ssh-exec（嵌套 map）。
+返回 alist ((KEY . VALUE) ...)，与 yaml-parse-map 格式相同。"
+  (let ((results nil)
+        (item-re (format
+                  "^\\([ \t]\\{%d\\}\\)-[ \t]+\\([^: \t][^:\n]*\\):[ \t]*\\([|>]\\)?[ \t]*\\(.*\\)$"
+                  indent)))
+    (catch 'done
+      (while t
+        (eon-workspace--yaml-skip-blanks)
+        (when (eobp) (throw 'done nil))
+        (let ((cur (eon-workspace--yaml-peek-indent)))
+          (unless (and cur (>= cur indent))
+            (throw 'done nil)))
+        (unless (looking-at item-re)
+          (throw 'done nil))
+        (let* ((key (string-trim (match-string 2)))
+               (block-char (match-string 3))
+               (inline-val (string-trim (match-string 4)))
+               (key-indent (length (match-string 1))))
+          (forward-line 1)
+          (cond
+           (block-char
+            (let ((content (eon-workspace--yaml-parse-block key-indent)))
+              (push (cons key (or content "")) results)))
+           ((not (string-empty-p inline-val))
+            (push (cons key inline-val) results))
+           (t
+            (let ((next-indent (eon-workspace--yaml-peek-indent)))
+              (if (and next-indent (> next-indent key-indent))
+                  (push (cons key
+                              (eon-workspace--yaml-parse-map next-indent))
+                        results)
+                (push (cons key "") results))))))))
+    (nreverse results)))
+
+(defun eon-workspace--parse-structured-action (file action-name)
+  "从 FILE 中解析 ACTION-NAME 的结构化 action（exec/ssh-exec 嵌套格式）。
+成功返回 alist 供 `eon-workspace--generate-structured-command' 使用；
+若 action 是扁平块字符串（有 | 或 >）则返回 nil，由调用方回退到旧格式。
+支持两种嵌套格式：
+  - map 格式（原有）：exec: | ... / ssh-exec: remote: ... exec: | ...
+  - list 格式（新增）：- exec: | ... / - ssh-exec: remote: ... exec: | ...
+list 格式允许多个同名 key 在同层出现。"
+  (when (and file (file-readable-p file))
+    (with-temp-buffer
+      (insert-file-contents file)
+      (goto-char (point-min))
+      ;; 找到 "action:" 节
+      (when (re-search-forward
+             (format "^%s:[ \t]*$" (regexp-quote eon-workspace-action-key))
+             nil t)
+        (forward-line 1)
+        (let ((child-indent (eon-workspace--yaml-peek-indent)))
+          (when child-indent
+            ;; 在 action 子节点中寻找目标 action-name
+            (let ((name-re
+                   (format "^\\([ \t]\\{%d,\\}\\)%s:[ \t]*\\([|>]\\)?[ \t]*$"
+                           child-indent (regexp-quote action-name))))
+              (while (and (not (eobp))
+                          (not (looking-at name-re)))
+                (forward-line 1))
+              (when (looking-at name-re)
+                (let ((block-char (match-string 2)))
+                  ;; 有 | 或 > → 扁平块字符串，回退
+                  (if block-char
+                      nil
+                    (forward-line 1)
+                    (let ((next-indent (eon-workspace--yaml-peek-indent)))
+                      (when (and next-indent (> next-indent child-indent))
+                        ;; 检测是 list 还是 map：看第一行是否有 "- " 前缀
+                        (if (save-excursion
+                              (eon-workspace--yaml-skip-blanks)
+                              (looking-at
+                               (format "^\\([ \t]\\{%d\\}\\)-[ \t]"
+                                       next-indent)))
+                            (eon-workspace--yaml-parse-list next-indent)
+                          (eon-workspace--yaml-parse-map next-indent))))))))))))))
+
+(defun eon-workspace--generate-structured-command (parsed &optional depth)
+  "将 PARSED（结构化 action 解析结果 alist）生成 shell 命令字符串。
+DEPTH 用于 heredoc 定界符编号，避免嵌套冲突。
+识别 key：exec（直接输出）、ssh-exec（生成 ssh heredoc 包装）。
+其他 string 类型的 value 直接输出，便于灵活命名。"
+  (let ((depth (or depth 0))
+        (parts nil))
+    (dolist (entry parsed)
+      (let ((key (car entry))
+            (val (cdr entry)))
+        (cond
+         ((equal key "exec")
+          (when (stringp val)
+            (push val parts)))
+         ((equal key "ssh-exec")
+          (unless (listp val)
+            (error "ssh-exec 的值必须是 map，不能是字符串"))
+          (let* ((remote (cdr (assoc "remote" val)))
+                 (delim (format "EON_SSH_%d" depth))
+                 (children (cl-remove-if
+                            (lambda (e) (equal (car e) "remote"))
+                            val))
+                 (inner (eon-workspace--generate-structured-command
+                         children (1+ depth)))
+                 (tab (make-string depth ?\t)))
+            (unless remote
+              (error "ssh-exec 缺少 remote 字段"))
+            (push (format "ssh %s bash -s <<-'%s'\n%s\n%s%s"
+                          remote delim
+                          (if (> depth 0)
+                              (string-join
+                               (mapcar (lambda (l) (concat tab l))
+                                       (split-string inner "\n"))
+                               "\n")
+                            inner)
+                          (if (> depth 0) tab "")
+                          delim)
+                  parts)))
+         ;; 其他 key：若值为字符串则直接输出
+         (t
+          (when (stringp val)
+            (push val parts))))))
+    (string-join (nreverse parts) "\n")))
+
 (defun eon-workspace--ignore-patterns (root)
   "读取 ROOT 下 `eon-workspace-config-file' 的忽略模式列表。"
   (let ((file (expand-file-name eon-workspace-config-file root)))
     (eon-workspace--parse-yaml-list file eon-workspace-ignore-patterns-key)))
 
 (defun eon-workspace--compile-command (root)
-  "读取 ROOT 下 `eon-workspace-config-file' 配置的 compile 命令。"
+  "读取 ROOT 下 `eon-workspace-config-file' 配置的 compile 命令。
+注意：此顶层 key 已废弃，推荐使用 `eon-workspace--action-command'。"
   (let ((file (expand-file-name eon-workspace-config-file root)))
     (eon-workspace--parse-yaml-block-string file eon-workspace-compile-key)))
+
+(defun eon-workspace--action-map (root)
+  "读取 ROOT 下 `eon-workspace-config-file' 配置的 action 子树。
+返回 ((NAME . COMMAND) ...) alist。"
+  (let ((file (expand-file-name eon-workspace-config-file root)))
+    (eon-workspace--parse-yaml-action-map file)))
+
+(defun eon-workspace--action-command (root name)
+  "读取 ROOT 下 .eon.yaml 中 action.NAME 的 shell 命令。
+优先检查结构化格式（exec/ssh-exec 嵌套），若无则回退到扁平块字符串格式。
+返回字符串，未配置时返回 nil。"
+  (let ((file (expand-file-name eon-workspace-config-file root)))
+    (or (let ((structured (eon-workspace--parse-structured-action file name)))
+          (when structured
+            (eon-workspace--generate-structured-command structured)))
+        (let ((actions (eon-workspace--action-map root)))
+          (cdr (assoc-string name actions))))))
 
 (defun eon-workspace--rg-ignored-globs (root)
   "从 ROOT 的 .eon.yaml ignore-patterns 生成 rg 的 --glob ! 参数串。"
@@ -732,7 +1018,7 @@ ROOT 是工作目录；NAME 是 workspace 名称，缺省由 ROOT 生成。
 ;;;###autoload
 (defun eon-workspace-init-config ()
   "在当前 workspace 根目录创建 `eon-workspace-config-file' 文件。
-若文件已存在则不做处理。默认内容包含忽略 .git 目录。"
+若文件已存在则不做处理。默认内容包含 ignore-patterns 和 action 子树。"
   (interactive)
   (let ((ws (eon-workspace-current)))
     (unless ws (user-error "当前 frame 未关联 workspace"))
@@ -747,27 +1033,35 @@ ROOT 是工作目录；NAME 是 workspace 名称，缺省由 ROOT 生成。
           (insert (format "%s:\n" eon-workspace-ignore-patterns-key))
           (insert "  - \".git\"\n")
           (insert "\n")
-          (insert (format "# %s: 编译命令（多行 shell 脚本），\n"
-                          eon-workspace-compile-key))
+          (insert "# action: 可自由配置的操作命令。每个子 key 对应一个 shell 命令。\n")
           (insert "# 执行时以 workspace 根目录作为工作目录。\n")
           (insert "# 支持 YAML 块字符串格式（| 或 >）。\n")
-          (insert (format "#%s: |\n" eon-workspace-compile-key))
-          (insert "#   echo \"TODO: 配置编译命令\"\n"))
+          (insert "# 通过 `M-x eon-workspace-action' 或 `M-x eon-workspace-action-<name>' 执行。\n")
+          (insert (format "%s:\n" eon-workspace-action-key))
+          (insert "  #compile: |\n")
+          (insert "  #  echo \"TODO: 配置编译命令\"\n")
+          (insert "  #test: |\n")
+          (insert "  #  echo \"TODO: 配置测试命令\"\n"))
         (message "已创建 %s" file)))))
 
 ;;;###autoload
 (defun eon-workspace-compile ()
-  "执行当前 workspace 的 .eon.yaml 中配置的 compile 命令。
-compile 的值应为多行 shell 命令，支持 YAML 块字符串格式（| 或 >）。
+  "执行当前 workspace 的 compile 命令。
+优先使用 action 子树中的 compile 配置（推荐方式），
+若不存在则回退到已废弃的顶层 compile key。
 编译输出显示在 *compilation-<workspace>* buffer 中。"
   (interactive)
   (let ((ws (eon-workspace-current)))
     (unless ws (user-error "当前 frame 未关联 workspace"))
     (let* ((root (eon-workspace-root ws))
-           (cmd (eon-workspace--compile-command root)))
+           (new-cmd (eon-workspace--action-command root "compile"))
+           (old-cmd (eon-workspace--compile-command root))
+           (cmd (or new-cmd old-cmd)))
       (unless cmd
         (user-error "%s 中未配置 compile 命令"
                     (expand-file-name eon-workspace-config-file root)))
+      (when (and (not new-cmd) old-cmd)
+        (message "警告：顶层 compile 键已废弃，请迁移到 action.compile"))
       (require 'compile)
       (let ((default-directory root))
         (compilation-start
@@ -775,6 +1069,68 @@ compile 的值应为多行 shell 命令，支持 YAML 块字符串格式（| 或
          (lambda (_)
            (format "*compilation-%s*" (eon-workspace-name ws))))))))
 
+(defun eon-workspace--action-dispatch (name)
+  "执行当前 workspace 中 action.NAME 的 shell 命令。
+编译输出显示在 *compilation-NAME* buffer 中。"
+  (let ((ws (eon-workspace-current)))
+    (unless ws (user-error "当前 frame 未关联 workspace"))
+    (let* ((root (eon-workspace-root ws))
+           (cmd (eon-workspace--action-command root name)))
+      (unless cmd
+        (user-error "当前 workspace 未配置 action.%s" name))
+      (require 'compile)
+      (let ((default-directory root))
+        (compilation-start
+         cmd nil
+         (lambda (_)
+           (format "*compilation-%s*" name)))))))
+
+(defun eon-workspace--make-action-command (name)
+  "为 action NAME 创建一个交互式命令函数。"
+  (lambda ()
+    (interactive)
+    (let ((ws (eon-workspace-current)))
+      (unless ws (user-error "当前 frame 未关联 workspace"))
+      (let* ((root (eon-workspace-root ws))
+             (cmd (eon-workspace--action-command root name)))
+        (unless cmd
+          (user-error "当前 workspace 未配置 action.%s" name))
+        (require 'compile)
+        (let ((default-directory root))
+          (compilation-start
+           cmd nil
+           (lambda (_)
+             (format "*compilation-%s*" name))))))))
+
+(defun eon-workspace--ensure-action-commands (&optional root)
+  "确保当前 workspace 的 action 都有对应的 `eon-workspace-action-<name>' 命令。
+可选参数 ROOT 指定 workspace 根目录；未提供时自动取当前 workspace。"
+  (let* ((root (or root (when-let ((ws (eon-workspace-current)))
+                          (eon-workspace-root ws))))
+         (actions (when root (eon-workspace--action-map root))))
+    (dolist (action actions)
+      (let* ((name (car action))
+             (sym (intern (format "eon-workspace-action-%s" name))))
+        (unless (fboundp sym)
+          (defalias sym (eon-workspace--make-action-command name)
+            (format "执行当前 workspace action: %s" name)))))))
+
+;;;###autoload
+(defun eon-workspace-action (action)
+  "执行当前 workspace 的 .eon.yaml 中配置的 action ACTION。
+通过 `completing-read' 从当前 workspace 已配置的 action 中选取。
+也可直接用 `M-x eon-workspace-action-<name>' 执行特定 action。"
+  (interactive
+   (let ((ws (eon-workspace-current)))
+     (unless ws (user-error "当前 frame 未关联 workspace"))
+     (let* ((root (eon-workspace-root ws))
+            (actions (eon-workspace--action-map root)))
+       (unless actions
+         (user-error ".eon.yaml 中未配置任何 action"))
+       (list (completing-read "选择 action: "
+                               (mapcar #'car actions) nil t)))))
+  (eon-workspace--action-dispatch action)
+  (eon-workspace--ensure-action-commands))
 
 ;;;; 配置界面 (customize-like)
 
@@ -784,11 +1140,16 @@ compile 的值应为多行 shell 命令，支持 YAML 块字符串格式（| 或
 (defvar-local eon-workspace-config--compile-widget nil
   "Buffer-local reference to the compile text widget.")
 
+(defvar-local eon-workspace-config--actions-widget nil
+  "Buffer-local reference to the actions editable-list widget.")
+
 (defvar-local eon-workspace-config--config-file nil
   "Buffer-local path to the .eon.yaml being edited.")
 
-(defun eon-workspace-config--write-yaml (file patterns compile-cmd)
-  "Write PATTERNS and COMPILE-CMD to FILE in .eon.yaml format."
+(defun eon-workspace-config--write-yaml (file patterns compile-cmd actions)
+  "Write PATTERNS, COMPILE-CMD and ACTIONS to FILE in .eon.yaml format.
+ACTIONS is a list of (NAME COMMAND) pairs. COMPILE-CMD is the legacy
+root-level compile command (deprecated)."
   (let ((filtered (seq-remove #'string-empty-p patterns)))
     (with-temp-file file
       (insert (format "# eon-workspace 配置文件\n"))
@@ -799,21 +1160,40 @@ compile 的值应为多行 shell 命令，支持 YAML 块字符串格式（| 或
           (dolist (p filtered)
             (insert (format "  - \"%s\"\n" p)))
         (insert "  []\n"))
+      ;; Legacy root-level compile (deprecated)
       (when (and compile-cmd (not (string-empty-p compile-cmd)))
         (insert "\n")
+        (insert (format "# 已废弃，请迁移到 action.compile\n"))
         (insert (format "%s: |\n" eon-workspace-compile-key))
         (dolist (line (split-string compile-cmd "\n"))
-          (insert (format "  %s\n" line)))))))
+          (insert (format "  %s\n" line))))
+      ;; Action subtree
+      (when actions
+        (insert "\n")
+        (insert (format "%s:\n" eon-workspace-action-key))
+        (dolist (action actions)
+          (let ((name (car action))
+                (cmd (cadr action)))
+            (when (and name (not (string-empty-p name)))
+              (if (and cmd (not (string-empty-p cmd)))
+                  (progn
+                    (insert (format "  %s: |\n" name))
+                    (dolist (line (split-string cmd "\n"))
+                      (insert (format "    %s\n" line))))
+                (insert (format "  %s: []\n" name))))))))))
 
 (defun eon-workspace-config--save ()
   "Read widget values and write them to .eon.yaml."
   (interactive)
   (if (and eon-workspace-config--editable-list
-           eon-workspace-config--compile-widget)
+           eon-workspace-config--compile-widget
+           eon-workspace-config--actions-widget)
       (let ((patterns (widget-value eon-workspace-config--editable-list))
-            (compile-cmd (widget-value eon-workspace-config--compile-widget)))
+            (compile-cmd (widget-value eon-workspace-config--compile-widget))
+            (actions (widget-value eon-workspace-config--actions-widget)))
         (eon-workspace-config--write-yaml eon-workspace-config--config-file
-                                          patterns compile-cmd)
+                                          patterns compile-cmd actions)
+        (eon-workspace--ensure-action-commands)
         (message "已保存到 %s" eon-workspace-config--config-file))
     (user-error "找不到配置 widget")))
 
@@ -823,13 +1203,15 @@ compile 的值应为多行 shell 命令，支持 YAML 块字符串格式（| 或
   (when eon-workspace-config--config-file
     (let* ((root (file-name-directory eon-workspace-config--config-file))
            (patterns (eon-workspace--ignore-patterns root))
-           (compile-cmd (eon-workspace--compile-command root)))
+           (compile-cmd (eon-workspace--compile-command root))
+           (actions (eon-workspace--action-map root)))
       (with-current-buffer (get-buffer-create "*Eon Config*")
         (let ((inhibit-read-only t))
           (erase-buffer)
           (remove-overlays)
           (setq eon-workspace-config--editable-list nil)
           (setq eon-workspace-config--compile-widget nil)
+          (setq eon-workspace-config--actions-widget nil)
           (widget-insert (propertize
                           (format "配置文件: %s\n\n"
                                   eon-workspace-config--config-file)
@@ -851,15 +1233,36 @@ compile 的值应为多行 shell 命令，支持 YAML 块字符串格式（| 或
                  '(editable-field :format "%v")))
           (widget-insert "\n")
           (widget-insert (propertize
-                          (format "%s:\n" eon-workspace-compile-key)
+                          (format "%s (已废弃):\n" eon-workspace-compile-key)
                           'face 'widget-documentation-face))
           (widget-insert
-           "  编译命令，多行 shell 脚本（将 workspace 根目录作为工作目录执行）。\n\n")
+           "  顶层 compile 键已废弃，请在下方 action 子树中配置 compile。\n\n")
           (setq eon-workspace-config--compile-widget
                 (widget-create 'text
                                :value (or compile-cmd "")
                                :indent 2
                                :size 4))
+          (widget-insert "\n")
+          (widget-insert (propertize
+                          (format "%s:\n" eon-workspace-action-key)
+                          'face 'widget-documentation-face))
+          (widget-insert
+           "  可自由配置的操作命令。每个 action 包含名称和 shell 命令。\n")
+          (widget-insert
+           "  可通过 `M-x eon-workspace-action' 或 `M-x eon-workspace-action-<name>' 执行。\n\n")
+          (setq eon-workspace-config--actions-widget
+                (widget-create
+                 'editable-list
+                 :entry-format "%i %d %v"
+                 :insert-button-args '(:tag "新增")
+                 :delete-button-args '(:tag "删除")
+                 :append-button-args '(:tag "新增")
+                 :value (mapcar (lambda (a) (list (car a) (cdr a))) actions)
+                 :indent 2
+                 '(group
+                   :format "%v"
+                   (editable-field :format "  Action name: %v\n")
+                   (text :format "  Command:\n%v\n" :size 4))))
           (widget-insert "\n")
           (widget-create 'push-button
                          :notify (lambda (&rest _) (eon-workspace-config--save))
@@ -879,9 +1282,8 @@ compile 的值应为多行 shell 命令，支持 YAML 块字符串格式（| 或
 ;;;###autoload
 (defun eon-workspace-config ()
   "用 customize 风格界面编辑当前 workspace 的 .eon.yaml 配置。
-在 *Eon Config* buffer 中以 widget 形式展示忽略模式列表和 compile 命令，
-每个忽略模式可独立编辑、新增或删除。提供保存 (C-c C-s)、
-还原 (C-c C-k)、退出 (q) 按钮与快捷键。"
+在 *Eon Config* buffer 中以 widget 形式展示忽略模式列表、compile 命令
+和 action 子树。提供保存 (C-c C-s)、还原 (C-c C-k)、退出 (q) 按钮与快捷键。"
   (interactive)
   (require 'wid-edit)
   (let ((ws (eon-workspace-current)))
@@ -890,6 +1292,7 @@ compile 的值应为多行 shell 命令，支持 YAML 块字符串格式（| 或
            (config-file (expand-file-name eon-workspace-config-file root))
            (patterns (eon-workspace--ignore-patterns root))
            (compile-cmd (eon-workspace--compile-command root))
+           (actions (eon-workspace--action-map root))
            (buf (get-buffer-create "*Eon Config*")))
       (pop-to-buffer buf)
       (with-current-buffer buf
@@ -898,6 +1301,7 @@ compile 的值应为多行 shell 命令，支持 YAML 块字符串格式（| 或
         (remove-overlays)
         (setq eon-workspace-config--editable-list nil)
         (setq eon-workspace-config--compile-widget nil)
+        (setq eon-workspace-config--actions-widget nil)
         (setq eon-workspace-config--config-file config-file)
         (widget-insert (propertize
                         (format "配置文件: %s\n\n" config-file)
@@ -919,15 +1323,36 @@ compile 的值应为多行 shell 命令，支持 YAML 块字符串格式（| 或
                '(editable-field :format "%v")))
         (widget-insert "\n")
         (widget-insert (propertize
-                        (format "%s:\n" eon-workspace-compile-key)
+                        (format "%s (已废弃):\n" eon-workspace-compile-key)
                         'face 'widget-documentation-face))
         (widget-insert
-         "  编译命令，多行 shell 脚本（将 workspace 根目录作为工作目录执行）。\n\n")
+         "  顶层 compile 键已废弃，请在下方 action 子树中配置 compile。\n\n")
         (setq eon-workspace-config--compile-widget
               (widget-create 'text
                              :value (or compile-cmd "")
                              :indent 2
                              :size 4))
+        (widget-insert "\n")
+        (widget-insert (propertize
+                        (format "%s:\n" eon-workspace-action-key)
+                        'face 'widget-documentation-face))
+        (widget-insert
+         "  可自由配置的操作命令。每个 action 包含名称和 shell 命令。\n")
+        (widget-insert
+         "  可通过 `M-x eon-workspace-action' 或 `M-x eon-workspace-action-<name>' 执行。\n\n")
+        (setq eon-workspace-config--actions-widget
+              (widget-create
+               'editable-list
+               :entry-format "%i %d %v"
+               :insert-button-args '(:tag "新增")
+               :delete-button-args '(:tag "删除")
+               :append-button-args '(:tag "新增")
+               :value (mapcar (lambda (a) (list (car a) (cdr a))) actions)
+               :indent 2
+               '(group
+                 :format "%v"
+                 (editable-field :format "  Action name: %v\n")
+                 (text :format "  Command:\n%v\n" :size 4))))
         (widget-insert "\n")
         (widget-create 'push-button
                        :notify (lambda (&rest _) (eon-workspace-config--save))
@@ -1196,6 +1621,7 @@ ROOT 为工作目录绝对路径；交互选择与 `eon-workspace-create' 相同
 (add-hook 'window-buffer-change-functions #'eon-workspace--track-frame-buffers)
 (add-hook 'kill-buffer-hook #'eon-workspace--untrack-killed-buffer)
 
+(require 'eon-workspace-format)
 
 (provide 'eon-workspace)
 ;;; eon-workspace.el ends here
