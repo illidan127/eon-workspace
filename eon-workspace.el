@@ -33,6 +33,7 @@
 ;;     - "*.log"
 ;;     - "dist"
 ;;   action:
+;;     default: compile
 ;;     compile: |
 ;;       echo "building..."
 ;;     test: |
@@ -53,6 +54,7 @@
 ;;   M-x eon-workspace-config           用 customize 风格界面编辑 .eon.yaml
 ;;   M-x eon-workspace-compile          执行 compile 命令（向后兼容，推荐 action.compile）
 ;;   M-x eon-workspace-action            从 .eon.yaml 中选择并执行 action
+;;   M-x eon-workspace-action-default    执行默认 action
 ;;   M-x eon-workspace-format            格式化 .eon.yaml 中 exec 块（eon-workspace-format.el）
 
 ;;; Code:
@@ -117,6 +119,12 @@ eon-workspace-recent.el。"
   ".eon.yaml 中表示 action 子树的顶层 key 名。
 action 子树下的每个子 key 对应一个可自由配置的 shell 命令，
 可通过 `M-x eon-workspace-action' 或 `M-x eon-workspace-action-<name>' 执行。"
+  :type 'string
+  :group 'eon-workspace)
+
+(defcustom eon-workspace-action-default-key "default"
+  ".eon.yaml 中 action 子树下表示默认 action 的 key 名。
+值为另一个已配置 action 的名称，通过 `M-x eon-workspace-action-default' 执行。"
   :type 'string
   :group 'eon-workspace)
 
@@ -550,29 +558,36 @@ NAME 是 action 名称，COMMAND 是对应的 shell 命令字符串。
               (setq sub-indent (length (match-string 1)))
               (goto-char (line-beginning-position)))
             (while (and (not (eobp))
-                        (looking-at
-                         (format "^\\([ \t]\\{%d,\\}\\)\\([^: \t]+\\):[ \t]*\\([|>]\\)?[ \t]*$"
-                                 (or sub-indent 0))))
-              (let* ((indent (length (match-string 1)))
-                     (name (string-trim (match-string 2)))
-                     (lines nil)
-                     (base-indent nil))
-                (unless sub-indent (setq sub-indent indent))
+                        (looking-at (format "^\\([ \t]\\{%d,\\}\\)"
+                                            (or sub-indent 0))))
+              (if (looking-at
+                   (format "^\\([ \t]\\{%d,\\}\\)\\([^: \t]+\\):[ \t]*\\([|>]\\)?[ \t]*$"
+                           (or sub-indent 0)))
+                  (let* ((indent (length (match-string 1)))
+                         (name (string-trim (match-string 2)))
+                         (lines nil)
+                         (base-indent nil))
+                    (unless sub-indent (setq sub-indent indent))
+                    (forward-line 1)
+                    (while (and (not (eobp))
+                                (looking-at (format "^\\([ \t]\\{%d,\\}\\)\\([^\n]*\\)$"
+                                                   (1+ indent))))
+                      (let ((line-indent (length (match-string 1)))
+                            (content (match-string 2)))
+                        (unless base-indent (setq base-indent line-indent))
+                        (when (>= line-indent base-indent)
+                          (push (substring
+                                 (concat (match-string 1) content)
+                                 base-indent)
+                                lines)))
+                      (forward-line 1))
+                    (when lines
+                      (push (cons name (string-join (nreverse lines) "\n"))
+                            results))
+                    (while (and (not (eobp)) (looking-at "^[ \t]*$"))
+                      (forward-line 1)))
+                ;; Skip non-matching indented line (e.g., inline value like default: compile)
                 (forward-line 1)
-                (while (and (not (eobp))
-                            (looking-at "^\\([ \t]+\\)\\([^\n]*\\)$"))
-                  (let ((line-indent (length (match-string 1)))
-                        (content (match-string 2)))
-                    (unless base-indent (setq base-indent line-indent))
-                    (when (>= line-indent base-indent)
-                      (push (substring
-                             (concat (match-string 1) content)
-                             base-indent)
-                            lines)))
-                  (forward-line 1))
-                (when lines
-                  (push (cons name (string-join (nreverse lines) "\n"))
-                        results))
                 (while (and (not (eobp)) (looking-at "^[ \t]*$"))
                   (forward-line 1))))
             (nreverse results)))))))
@@ -749,17 +764,23 @@ DEPTH 用于 heredoc 定界符编号，避免嵌套冲突。
           (unless (listp val)
             (error "ssh-exec 的值必须是 map，不能是字符串"))
           (let* ((remote (cdr (assoc "remote" val)))
+                 (arg (cdr (assoc "arg" val)))
                  (delim (format "EON_SSH_%d" depth))
                  (children (cl-remove-if
-                            (lambda (e) (equal (car e) "remote"))
+                            (lambda (e)
+                              (member (car e) '("remote" "arg")))
                             val))
                  (inner (eon-workspace--generate-structured-command
                          children (1+ depth)))
                  (tab (make-string depth ?\t)))
             (unless remote
               (error "ssh-exec 缺少 remote 字段"))
-            (push (format "ssh %s bash -s <<-'%s'\n%s\n%s%s"
-                          remote delim
+            (push (format "ssh%s %s bash -l -s <<-%s%s%s\n%s\n%s%s"
+                          (if arg (concat " " arg) "")
+                          remote
+                          (if (> depth 0) "'" "")
+                          delim
+                          (if (> depth 0) "'" "")
                           (if (> depth 0)
                               (string-join
                                (mapcar (lambda (l) (concat tab l))
@@ -788,9 +809,12 @@ DEPTH 用于 heredoc 定界符编号，避免嵌套冲突。
 
 (defun eon-workspace--action-map (root)
   "读取 ROOT 下 `eon-workspace-config-file' 配置的 action 子树。
-返回 ((NAME . COMMAND) ...) alist。"
+返回 ((NAME . COMMAND) ...) alist，过滤掉 default 等元 key。"
   (let ((file (expand-file-name eon-workspace-config-file root)))
-    (eon-workspace--parse-yaml-action-map file)))
+    (seq-remove
+     (lambda (entry)
+       (string= (car entry) eon-workspace-action-default-key))
+     (eon-workspace--parse-yaml-action-map file))))
 
 (defun eon-workspace--action-command (root name)
   "读取 ROOT 下 .eon.yaml 中 action.NAME 的 shell 命令。
@@ -802,6 +826,22 @@ DEPTH 用于 heredoc 定界符编号，避免嵌套冲突。
             (eon-workspace--generate-structured-command structured)))
         (let ((actions (eon-workspace--action-map root)))
           (cdr (assoc-string name actions))))))
+
+(defun eon-workspace--action-default-name (root)
+  "从 ROOT 下 .eon.yaml 的 action 子树中读取默认 action 名称。
+返回字符串，未配置时返回 nil。"
+  (let ((file (expand-file-name eon-workspace-config-file root)))
+    (when (and file (file-readable-p file))
+      (with-temp-buffer
+        (insert-file-contents file)
+        (goto-char (point-min))
+        (let ((action-header (format "^%s:[ \t]*$"
+                                     (regexp-quote eon-workspace-action-key))))
+          (when (re-search-forward action-header nil t)
+            (let ((default-re (format "^[ \t]+%s:[ \t]+\\(.+\\)$"
+                                      (regexp-quote eon-workspace-action-default-key))))
+              (when (re-search-forward default-re nil t)
+                (string-trim (match-string 1))))))))))
 
 (defun eon-workspace--rg-ignored-globs (root)
   "从 ROOT 的 .eon.yaml ignore-patterns 生成 rg 的 --glob ! 参数串。"
@@ -1034,10 +1074,12 @@ ROOT 是工作目录；NAME 是 workspace 名称，缺省由 ROOT 生成。
           (insert "  - \".git\"\n")
           (insert "\n")
           (insert "# action: 可自由配置的操作命令。每个子 key 对应一个 shell 命令。\n")
+          (insert "# default: 指定默认执行的 action 名称（可选），通过 `M-x eon-workspace-action-default' 执行。\n")
           (insert "# 执行时以 workspace 根目录作为工作目录。\n")
           (insert "# 支持 YAML 块字符串格式（| 或 >）。\n")
           (insert "# 通过 `M-x eon-workspace-action' 或 `M-x eon-workspace-action-<name>' 执行。\n")
           (insert (format "%s:\n" eon-workspace-action-key))
+          (insert (format "  #%s: compile\n" eon-workspace-action-default-key))
           (insert "  #compile: |\n")
           (insert "  #  echo \"TODO: 配置编译命令\"\n")
           (insert "  #test: |\n")
@@ -1132,67 +1174,81 @@ ROOT 是工作目录；NAME 是 workspace 名称，缺省由 ROOT 生成。
   (eon-workspace--action-dispatch action)
   (eon-workspace--ensure-action-commands))
 
+;;;###autoload
+(defun eon-workspace-action-default ()
+  "执行当前 workspace 的默认 action。
+默认 action 由 .eon.yaml 中 action 子树下的 `default' key 指定，
+值应为另一个已配置 action 的名称。"
+  (interactive)
+  (let ((ws (eon-workspace-current)))
+    (unless ws (user-error "当前 frame 未关联 workspace"))
+    (let* ((root (eon-workspace-root ws))
+           (default (eon-workspace--action-default-name root)))
+      (unless default
+        (user-error ".eon.yaml 中未配置 action.default"))
+      (unless (eon-workspace--action-command root default)
+        (user-error "默认 action 指向的 action.%s 未配置" default))
+      (eon-workspace--action-dispatch default))))
+
 ;;;; 配置界面 (customize-like)
 
 (defvar-local eon-workspace-config--editable-list nil
-  "Buffer-local reference to the editable-list widget.")
+  "Buffer-local reference to the ignore-patterns editable-list widget.")
 
-(defvar-local eon-workspace-config--compile-widget nil
-  "Buffer-local reference to the compile text widget.")
-
-(defvar-local eon-workspace-config--actions-widget nil
-  "Buffer-local reference to the actions editable-list widget.")
+(defvar-local eon-workspace-config--default-widget nil
+  "Buffer-local reference to the default action text widget.")
 
 (defvar-local eon-workspace-config--config-file nil
   "Buffer-local path to the .eon.yaml being edited.")
 
-(defun eon-workspace-config--write-yaml (file patterns compile-cmd actions)
-  "Write PATTERNS, COMPILE-CMD and ACTIONS to FILE in .eon.yaml format.
-ACTIONS is a list of (NAME COMMAND) pairs. COMPILE-CMD is the legacy
-root-level compile command (deprecated)."
+(defun eon-workspace-config--write-yaml (file patterns default-action)
+  "Update FILE: replace ignore-patterns and action.default lines.
+Everything else in the file is preserved untouched."
   (let ((filtered (seq-remove #'string-empty-p patterns)))
-    (with-temp-file file
-      (insert (format "# eon-workspace 配置文件\n"))
-      (insert (format "# %s: 列表中的每项作为 -E 参数传给 fd，用于过滤文件。\n\n"
-                      eon-workspace-ignore-patterns-key))
-      (insert (format "%s:\n" eon-workspace-ignore-patterns-key))
-      (if filtered
-          (dolist (p filtered)
-            (insert (format "  - \"%s\"\n" p)))
-        (insert "  []\n"))
-      ;; Legacy root-level compile (deprecated)
-      (when (and compile-cmd (not (string-empty-p compile-cmd)))
-        (insert "\n")
-        (insert (format "# 已废弃，请迁移到 action.compile\n"))
-        (insert (format "%s: |\n" eon-workspace-compile-key))
-        (dolist (line (split-string compile-cmd "\n"))
-          (insert (format "  %s\n" line))))
-      ;; Action subtree
-      (when actions
-        (insert "\n")
-        (insert (format "%s:\n" eon-workspace-action-key))
-        (dolist (action actions)
-          (let ((name (car action))
-                (cmd (cadr action)))
-            (when (and name (not (string-empty-p name)))
-              (if (and cmd (not (string-empty-p cmd)))
-                  (progn
-                    (insert (format "  %s: |\n" name))
-                    (dolist (line (split-string cmd "\n"))
-                      (insert (format "    %s\n" line))))
-                (insert (format "  %s: []\n" name))))))))))
+    (with-temp-buffer
+      (insert-file-contents file)
+      ;; Replace ignore-patterns block
+      (goto-char (point-min))
+      (when (re-search-forward (format "^%s:" (regexp-quote eon-workspace-ignore-patterns-key)) nil t)
+        (forward-line 1)
+        (while (and (not (eobp)) (looking-at "^[ \t]+"))
+          (delete-region (line-beginning-position) (line-beginning-position 2)))
+        (if filtered
+            (dolist (p filtered)
+              (insert (format "  - \"%s\"\n" p)))
+          (insert "  []\n")))
+      ;; Update/add action.default
+      (goto-char (point-min))
+      (when (re-search-forward (format "^%s:[ \t]*$" (regexp-quote eon-workspace-action-key)) nil t)
+        (let ((default-re (format "^[ \t]+%s:" (regexp-quote eon-workspace-action-default-key)))
+              (found nil))
+          (forward-line 1)
+          (while (and (not (eobp)) (looking-at "^[ \t]*$"))
+            (forward-line 1))
+          (while (and (not (eobp)) (looking-at "^[ \t]+"))
+            (if (looking-at default-re)
+                (progn
+                  (setq found t)
+                  (delete-region (line-beginning-position) (line-beginning-position 2))
+                  (when (and default-action (not (string-empty-p default-action)))
+                    (insert (format "  %s: %s\n"
+                                    eon-workspace-action-default-key default-action))))
+              (forward-line 1)))
+          (unless found
+            (when (and default-action (not (string-empty-p default-action)))
+              (insert (format "  %s: %s\n"
+                              eon-workspace-action-default-key default-action))))))
+      (write-region nil nil file))))
 
 (defun eon-workspace-config--save ()
-  "Read widget values and write them to .eon.yaml."
+  "Read widget values and update .eon.yaml in-place."
   (interactive)
-  (if (and eon-workspace-config--editable-list
-           eon-workspace-config--compile-widget
-           eon-workspace-config--actions-widget)
+  (if eon-workspace-config--editable-list
       (let ((patterns (widget-value eon-workspace-config--editable-list))
-            (compile-cmd (widget-value eon-workspace-config--compile-widget))
-            (actions (widget-value eon-workspace-config--actions-widget)))
+            (default-action (when eon-workspace-config--default-widget
+                              (widget-value eon-workspace-config--default-widget))))
         (eon-workspace-config--write-yaml eon-workspace-config--config-file
-                                          patterns compile-cmd actions)
+                                          patterns default-action)
         (eon-workspace--ensure-action-commands)
         (message "已保存到 %s" eon-workspace-config--config-file))
     (user-error "找不到配置 widget")))
@@ -1201,177 +1257,114 @@ root-level compile command (deprecated)."
   "Reload config from .eon.yaml and refresh the widget buffer."
   (interactive)
   (when eon-workspace-config--config-file
-    (let* ((root (file-name-directory eon-workspace-config--config-file))
-           (patterns (eon-workspace--ignore-patterns root))
-           (compile-cmd (eon-workspace--compile-command root))
-           (actions (eon-workspace--action-map root)))
-      (with-current-buffer (get-buffer-create "*Eon Config*")
-        (let ((inhibit-read-only t))
-          (erase-buffer)
-          (remove-overlays)
-          (setq eon-workspace-config--editable-list nil)
-          (setq eon-workspace-config--compile-widget nil)
-          (setq eon-workspace-config--actions-widget nil)
-          (widget-insert (propertize
-                          (format "配置文件: %s\n\n"
-                                  eon-workspace-config--config-file)
-                          'face 'bold))
-          (widget-insert (propertize
-                          (format "%s:\n" eon-workspace-ignore-patterns-key)
-                          'face 'widget-documentation-face))
-          (widget-insert
-           "  作为 fd -E / rg --glob ! 参数叠加，用于排除文件。\n\n")
-          (setq eon-workspace-config--editable-list
-                (widget-create
-                 'editable-list
-                 :entry-format "%i %d %v"
-                 :insert-button-args '(:tag "新增")
-                 :delete-button-args '(:tag "删除")
-                 :append-button-args '(:tag "新增")
-                 :value (or patterns '())
-                 :indent 2
-                 '(editable-field :format "%v")))
-          (widget-insert "\n")
-          (widget-insert (propertize
-                          (format "%s (已废弃):\n" eon-workspace-compile-key)
-                          'face 'widget-documentation-face))
-          (widget-insert
-           "  顶层 compile 键已废弃，请在下方 action 子树中配置 compile。\n\n")
-          (setq eon-workspace-config--compile-widget
-                (widget-create 'text
-                               :value (or compile-cmd "")
-                               :indent 2
-                               :size 4))
-          (widget-insert "\n")
-          (widget-insert (propertize
-                          (format "%s:\n" eon-workspace-action-key)
-                          'face 'widget-documentation-face))
-          (widget-insert
-           "  可自由配置的操作命令。每个 action 包含名称和 shell 命令。\n")
-          (widget-insert
-           "  可通过 `M-x eon-workspace-action' 或 `M-x eon-workspace-action-<name>' 执行。\n\n")
-          (setq eon-workspace-config--actions-widget
-                (widget-create
-                 'editable-list
-                 :entry-format "%i %d %v"
-                 :insert-button-args '(:tag "新增")
-                 :delete-button-args '(:tag "删除")
-                 :append-button-args '(:tag "新增")
-                 :value (mapcar (lambda (a) (list (car a) (cdr a))) actions)
-                 :indent 2
-                 '(group
-                   :format "%v"
-                   (editable-field :format "  Action name: %v\n")
-                   (text :format "  Command:\n%v\n" :size 4))))
-          (widget-insert "\n")
-          (widget-create 'push-button
-                         :notify (lambda (&rest _) (eon-workspace-config--save))
-                         "保存")
-          (widget-insert "  ")
-          (widget-create 'push-button
-                         :notify (lambda (&rest _) (eon-workspace-config--revert))
-                         "还原")
-          (widget-insert "  ")
-          (widget-create 'push-button
-                         :notify (lambda (&rest _) (quit-window))
-                         "退出")
-          (widget-setup)
-          (widget-forward 1)))
-      (message "配置已还原"))))
+    (let ((root (file-name-directory eon-workspace-config--config-file)))
+      (eon-workspace-config--render root (current-buffer)))))
 
 ;;;###autoload
 (defun eon-workspace-config ()
-  "用 customize 风格界面编辑当前 workspace 的 .eon.yaml 配置。
-在 *Eon Config* buffer 中以 widget 形式展示忽略模式列表、compile 命令
-和 action 子树。提供保存 (C-c C-s)、还原 (C-c C-k)、退出 (q) 按钮与快捷键。"
+  "用 widget 界面管理当前 workspace 的 .eon.yaml 配置。
+在 *Eon Config* buffer 中可编辑 ignore-patterns 和 action.default，
+其他 action 以只读方式展示。action 的新增、修改、删除请直接编辑配置文件。
+提供保存 (C-c C-s)、还原 (C-c C-k)、退出 (q) 按钮与快捷键。"
   (interactive)
   (require 'wid-edit)
   (let ((ws (eon-workspace-current)))
     (unless ws (user-error "当前 frame 未关联 workspace"))
     (let* ((root (eon-workspace-root ws))
            (config-file (expand-file-name eon-workspace-config-file root))
-           (patterns (eon-workspace--ignore-patterns root))
-           (compile-cmd (eon-workspace--compile-command root))
-           (actions (eon-workspace--action-map root))
            (buf (get-buffer-create "*Eon Config*")))
       (pop-to-buffer buf)
-      (with-current-buffer buf
-        (let ((inhibit-read-only t))
-          (erase-buffer))
-        (remove-overlays)
-        (setq eon-workspace-config--editable-list nil)
-        (setq eon-workspace-config--compile-widget nil)
-        (setq eon-workspace-config--actions-widget nil)
-        (setq eon-workspace-config--config-file config-file)
-        (widget-insert (propertize
-                        (format "配置文件: %s\n\n" config-file)
-                        'face 'bold))
-        (widget-insert (propertize
-                        (format "%s:\n" eon-workspace-ignore-patterns-key)
-                        'face 'widget-documentation-face))
+      (setq eon-workspace-config--config-file config-file)
+      (eon-workspace-config--render root buf))))
+
+(defun eon-workspace-config--render (root buf)
+  "Populate BUF with widgets for ROOT's .eon.yaml."
+  (let* ((config-file (expand-file-name eon-workspace-config-file root))
+         (patterns (eon-workspace--ignore-patterns root))
+         (default-action (eon-workspace--action-default-name root))
+         (actions (eon-workspace--action-map root)))
+    (with-current-buffer buf
+      (let ((inhibit-read-only t))
+        (erase-buffer))
+      (remove-overlays)
+      (setq eon-workspace-config--editable-list nil)
+      (setq eon-workspace-config--default-widget nil)
+      (setq eon-workspace-config--config-file config-file)
+      (widget-insert (propertize
+                      (format "配置文件: %s\n\n" config-file)
+                      'face 'bold))
+      ;; --- ignore-patterns (editable) ---
+      (widget-insert (propertize
+                      (format "%s:\n" eon-workspace-ignore-patterns-key)
+                      'face 'widget-documentation-face))
+      (widget-insert
+       "  作为 fd -E / rg --glob ! 参数叠加，用于排除文件。\n\n")
+      (setq eon-workspace-config--editable-list
+            (widget-create
+             'editable-list
+             :entry-format "%i %d %v"
+             :insert-button-args '(:tag "新增")
+             :delete-button-args '(:tag "删除")
+             :append-button-args '(:tag "新增")
+             :value (or patterns '())
+             :indent 2
+             '(editable-field :format "%v")))
+      (widget-insert "\n")
+      ;; --- action subtree ---
+      (widget-insert (propertize
+                      (format "%s:\n" eon-workspace-action-key)
+                      'face 'widget-documentation-face))
+      ;; default (editable)
+      (widget-insert
+       (format "  %s: 指定默认执行的 action 名称，为空则表示无默认。\n"
+               eon-workspace-action-default-key))
+      (setq eon-workspace-config--default-widget
+            (widget-create 'editable-field
+                           :format (format "  %s: %%v\n" eon-workspace-action-default-key)
+                           :value (or default-action "")))
+      (widget-insert "\n")
+      ;; Other actions (read-only display)
+      (if actions
+          (progn
+            (widget-insert
+             "  已配置的 action（只读展示，修改请直接编辑配置文件）:\n\n")
+            (dolist (action actions)
+              (let ((name (car action))
+                    (cmd (cdr action)))
+                (widget-insert
+                 (propertize (format "  %s:\n" name) 'face 'widget-documentation-face))
+                (if (and cmd (not (string-empty-p cmd)))
+                    (dolist (line (split-string cmd "\n"))
+                      (widget-insert (format "    %s\n" line)))
+                  (widget-insert "    (无命令)\n"))
+                (widget-insert "\n"))))
         (widget-insert
-         "  作为 fd -E / rg --glob ! 参数叠加，用于排除文件。\n\n")
-        (setq eon-workspace-config--editable-list
-              (widget-create
-               'editable-list
-               :entry-format "%i %d %v"
-               :insert-button-args '(:tag "新增")
-               :delete-button-args '(:tag "删除")
-               :append-button-args '(:tag "新增")
-               :value (or patterns '())
-               :indent 2
-               '(editable-field :format "%v")))
-        (widget-insert "\n")
-        (widget-insert (propertize
-                        (format "%s (已废弃):\n" eon-workspace-compile-key)
-                        'face 'widget-documentation-face))
-        (widget-insert
-         "  顶层 compile 键已废弃，请在下方 action 子树中配置 compile。\n\n")
-        (setq eon-workspace-config--compile-widget
-              (widget-create 'text
-                             :value (or compile-cmd "")
-                             :indent 2
-                             :size 4))
-        (widget-insert "\n")
-        (widget-insert (propertize
-                        (format "%s:\n" eon-workspace-action-key)
-                        'face 'widget-documentation-face))
-        (widget-insert
-         "  可自由配置的操作命令。每个 action 包含名称和 shell 命令。\n")
-        (widget-insert
-         "  可通过 `M-x eon-workspace-action' 或 `M-x eon-workspace-action-<name>' 执行。\n\n")
-        (setq eon-workspace-config--actions-widget
-              (widget-create
-               'editable-list
-               :entry-format "%i %d %v"
-               :insert-button-args '(:tag "新增")
-               :delete-button-args '(:tag "删除")
-               :append-button-args '(:tag "新增")
-               :value (mapcar (lambda (a) (list (car a) (cdr a))) actions)
-               :indent 2
-               '(group
-                 :format "%v"
-                 (editable-field :format "  Action name: %v\n")
-                 (text :format "  Command:\n%v\n" :size 4))))
-        (widget-insert "\n")
-        (widget-create 'push-button
-                       :notify (lambda (&rest _) (eon-workspace-config--save))
-                       "保存")
-        (widget-insert "  ")
-        (widget-create 'push-button
-                       :notify (lambda (&rest _) (eon-workspace-config--revert))
-                       "还原")
-        (widget-insert "  ")
-        (widget-create 'push-button
-                       :notify (lambda (&rest _) (quit-window))
-                       "退出")
-        (use-local-map (copy-keymap widget-keymap))
-        (local-set-key (kbd "C-c C-s") #'eon-workspace-config--save)
-        (local-set-key (kbd "C-c C-k") #'eon-workspace-config--revert)
-        (local-set-key (kbd "q") #'quit-window)
-        (widget-setup)
-        (goto-char (point-min))
-        (widget-forward 1)))))
+         "  尚未配置 action。可通过直接编辑配置文件添加。\n\n"))
+      (widget-insert
+       (propertize
+        "提示: action 的新增、修改、删除请直接编辑配置文件，保存后点「还原」刷新。\n"
+        'face 'font-lock-comment-face))
+      (widget-insert "\n")
+      ;; --- Buttons ---
+      (widget-create 'push-button
+                     :notify (lambda (&rest _) (eon-workspace-config--save))
+                     "保存")
+      (widget-insert "  ")
+      (widget-create 'push-button
+                     :notify (lambda (&rest _) (eon-workspace-config--revert))
+                     "还原")
+      (widget-insert "  ")
+      (widget-create 'push-button
+                     :notify (lambda (&rest _) (quit-window))
+                     "退出")
+      (use-local-map (copy-keymap widget-keymap))
+      (local-set-key (kbd "C-c C-s") #'eon-workspace-config--save)
+      (local-set-key (kbd "C-c C-k") #'eon-workspace-config--revert)
+      (local-set-key (kbd "q") #'quit-window)
+      (widget-setup)
+      (goto-char (point-min))
+      (widget-forward 1))))
+
 
 
 ;;;###autoload
