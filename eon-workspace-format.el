@@ -174,6 +174,26 @@ body 行缩进为 opener 行前缀再加 `eon-workspace--shfmt-indent' 空格；
       (setq content (string-join (nreverse out) "\n"))))
   content)
 
+(defun eon-workspace--normalize-continuations (content)
+  "统一 CONTENT 中反斜杠续行的缩进。
+shfmt 不处理引号字符串内部，因此这部分续行保持原始缩进。
+此函数确保所有 \\ 续行使用统一的 `eon-workspace--shfmt-indent' 缩进。"
+  (let* ((lines (split-string content "\n"))
+         (out nil)
+         (cont-prefix (make-string eon-workspace--shfmt-indent ?\s))
+         (prev-cont nil))
+    (dolist (line lines)
+      (if prev-cont
+          (let ((trimmed (string-trim-right line)))
+            (push (concat cont-prefix (string-trim-left line)) out)
+            (setq prev-cont (and (> (length trimmed) 0)
+                                 (eq (aref trimmed (1- (length trimmed))) ?\\))))
+        (let ((trimmed (string-trim-right line)))
+          (push line out)
+          (setq prev-cont (and (> (length trimmed) 0)
+                               (eq (aref trimmed (1- (length trimmed))) ?\\))))))
+    (string-join (nreverse out) "\n")))
+
 (defun eon-workspace--shfmt-recursive (content)
   "递归格式化 CONTENT，自动处理其中的 << / <<- heredoc 体。
 先通过 heredoc-prepare 把内层 heredoc 体也格式化完，再整体跑 shfmt。"
@@ -201,23 +221,31 @@ KEY-INDENT 是 exec key 所在行的缩进列数。
 成功返回 t，失败返回 nil。"
   (let* ((block-start (line-beginning-position))
          (content-base nil)
-         (lines nil))
-    ;; 收集内容行（缩进 > key-indent）
+         (lines nil)
+         (min-indent (1+ key-indent)))
+    ;; 收集内容行（缩进 > key-indent，含块内空白行）
     (while (and (not (eobp))
-                (looking-at (format "^\\([ \t]\\{%d,\\}\\)\\(.+\\)$"
-                                   (1+ key-indent))))
-      (let ((line-indent (length (match-string 1)))
-            (content (match-string 2)))
-        (unless content-base
-          (setq content-base line-indent))
-        (push (substring (concat (match-string 1) content)
-                         content-base)
-              lines)
-        (forward-line 1)))
-    (when lines
+                (or (looking-at (format "^\\([ \t]\\{%d,\\}\\)\\(.*\\)$"
+                                        min-indent))
+                    (and content-base
+                         (looking-at-p "^[ \t]*$"))))
+      (if (looking-at-p "^[ \t]*$")
+          (push "" lines)
+        (let* ((line-indent (length (match-string 1)))
+               (content (match-string 2)))
+          (unless content-base
+            (setq content-base line-indent))
+          (push (if (string-empty-p content)
+                    ""
+                  (substring (concat (match-string 1) content)
+                             content-base))
+                lines)))
+      (forward-line 1))
+    (when (and lines content-base)
       (let* ((block-end (point))
              (raw (string-join (nreverse lines) "\n"))
-             (formatted (eon-workspace--shfmt-recursive raw)))
+             (normalized (eon-workspace--normalize-continuations raw))
+             (formatted (eon-workspace--shfmt-recursive normalized)))
         (when (and formatted (not (string-empty-p formatted)))
           (delete-region block-start block-end)
           (goto-char block-start)

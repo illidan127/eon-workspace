@@ -609,20 +609,27 @@ NAME 是 action 名称，COMMAND 是对应的 shell 命令字符串。
 (defun eon-workspace--yaml-parse-block (parent-indent)
   "解析 YAML 块字符串内容。PARENT-INDENT 是父 key 的缩进列数。
 point 应在第一条内容行。返回去缩进后的多行字符串。
-遇到缩进 <= PARENT-INDENT 的行或 EOF 时停止。"
+遇到缩进 <= PARENT-INDENT 的非空白行或 EOF 时停止。"
   (let ((lines nil)
-        (content-indent nil))
+        (content-indent nil)
+        (min-indent (1+ parent-indent)))
     (while (and (not (eobp))
-                (looking-at (format "^\\([ \t]\\{%d,\\}\\)\\(.+\\)$"
-                                   (1+ parent-indent))))
-      (let* ((line-indent (length (match-string 1)))
-             (content (match-string 2)))
-        (unless content-indent
-          (setq content-indent line-indent))
-        (push (substring (concat (match-string 1) content)
-                         content-indent)
-              lines)
-        (forward-line 1)))
+                (or (looking-at (format "^\\([ \t]\\{%d,\\}\\)\\(.*\\)$"
+                                        min-indent))
+                    (and content-indent
+                         (looking-at-p "^[ \t]*$"))))
+      (if (looking-at-p "^[ \t]*$")
+          (push "" lines)
+        (let* ((line-indent (length (match-string 1)))
+               (content (match-string 2)))
+          (unless content-indent
+            (setq content-indent line-indent))
+          (push (if (string-empty-p content)
+                    ""
+                  (substring (concat (match-string 1) content)
+                             content-indent))
+                lines)))
+      (forward-line 1))
     (when lines
       (string-trim-right (string-join (nreverse lines) "\n")))))
 
