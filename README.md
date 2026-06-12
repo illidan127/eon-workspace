@@ -6,7 +6,7 @@
 
 - **Frame 隔离**：不同 workspace 运行在不同 frame 中
 - **固定根目录**：创建时绑定 `root`，之后不可修改
-- **创建即切换**：`eon-workspace-create` 从已知项目列表选择；已打开则切换 frame，未打开则新建
+- **创建即切换**：`eon-workspace-create` 从已知项目列表选择（已打开的工作区优先排在前面，均按最近使用排序）；已打开则切换 frame，未打开则新建
 - **Buffer 隔离**：`eon-workspace-buffer-isolation-mode` 通过 `buffer-predicate` 与 `read-buffer-function` 限制各 workspace 可见 buffer
 - **项目内找文件**：`eon-workspace-find-file` 用 `fd` 列出文件，Ivy 选择（支持 `ivy-occur`），遵守 `.gitignore`，并叠加 `.eon.yaml` 忽略规则
 - **项目内搜索**：`eon-workspace-rg` 在当前 workspace 根目录执行 `counsel-rg`
@@ -73,7 +73,7 @@
 | 文件 | 作用 |
 |------|------|
 | `eon-workspace-projects.el` | 已知项目固定集合，仅 `add-project` / `remove-project` 增删，顺序稳定 |
-| `eon-workspace-recent.el` | F8 列表的 MRU 顺序，每次切换/创建 workspace 时更新 |
+| `eon-workspace-recent.el` | F8 列表的 MRU 顺序，每次切换/创建 workspace 时更新；已打开项优先排前 |
 
 加载 `projects` 时会自动去重并写回。首次无 `recent` 文件时，用当前 `projects` 顺序初始化。
 
