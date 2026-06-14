@@ -178,6 +178,8 @@ collection-files:
 
 在集合目录下按工作区路径镜像子目录结构存放。例如 `/Users/abc/project/src/config.json` 存储为 `<collection>/Users/abc/project/src/config.json`。
 
+若 `eon-workspace-collection-path` 位于 git 仓库内，`eon-workspace-collect-config` 在同步完成后会自动以当前时间（精确到秒）为提交信息执行 `git add -A` + `git commit`，实现配置变更的自动版本记录。
+
 ### Config 界面
 
 `M-x eon-workspace-config` 打开 widget 界面，可编辑：

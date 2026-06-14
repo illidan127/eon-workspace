@@ -1691,7 +1691,21 @@ collection-files 列表所列文件各建立硬连接，实现双向同步：
                 (sync-one ws-file col-file root))))))
       (message (concat "[eon-workspace] 配置收集完成：%d 个已连接, "
                        "%d 个已恢复, %d 个冲突")
-               linked restored conflicts))))
+               linked restored conflicts)
+      (eon-workspace--collection-git-commit col-dir))))
+
+(defun eon-workspace--collection-git-commit (dir)
+  "若 DIR 在 git 仓库中且工作区有变更，自动提交。"
+  (when (executable-find "git")
+    (let ((default-directory dir))
+      (when (eq 0 (call-process "git" nil nil nil
+                                "rev-parse" "--show-toplevel"))
+        (unless (string-blank-p
+                 (shell-command-to-string "git status --porcelain"))
+          (call-process "git" nil nil nil "add" "-A")
+          (call-process "git" nil nil nil "commit" "-m"
+                        (format-time-string "%Y-%m-%d %H:%M:%S"))
+          (message "[eon-workspace] 已自动提交配置变更"))))))
 
 ;;;###autoload
 (defun eon-workspace-list ()
