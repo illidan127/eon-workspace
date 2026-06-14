@@ -12,6 +12,7 @@
 - **项目内搜索**：`eon-workspace-rg` 在当前 workspace 根目录执行 `counsel-rg`
 - **Action 系统**：在 `.eon.yaml` 中定义可复用的 shell 操作（编译、部署、同步等），支持本地执行与 SSH 远程执行
 - **清理**：`eon-workspace-cleanup` 关闭当前 workspace 中位于根目录之外的文件 buffer
+- **配置收集**：`eon-workspace-collect-config` 将所有工作区的 `.eon.yaml` 及 `collection-files` 中列出的文件通过硬连接汇集到统一目录，双向同步、互为备份
 
 ## 依赖
 
@@ -63,6 +64,7 @@
 | `eon-workspace-action` | 从已配置的 action 中选择并执行 |
 | `eon-workspace-action-default` | 执行 `action.default` 指定的默认 action |
 | `eon-workspace-compile` | 执行 compile 命令（向后兼容，推荐迁移到 action.compile） |
+| `eon-workspace-collect-config` | 将所有工作区的 .eon.yaml 及 collection-files 通过硬连接汇集到统一目录 |
 
 每个 workspace 的 action 还会自动注册为 `M-x eon-workspace-action-<name>` 形式的独立命令，可直接调用或绑定快捷键。
 
@@ -164,6 +166,18 @@ action:
 
 如有需要原样传给远端的 `$`，用 `\$` 转义。
 
+### 配置收集（collection-files）
+
+`collection-files` 列出相对于工作区根目录的文件路径，这些文件会随 `.eon.yaml` 一起被 `eon-workspace-collect-config` 通过硬连接同步到 `eon-workspace-collection-path` 下，实现任意一边修改、另一边即时生效。
+
+```yaml
+collection-files:
+  - "src/config.json"
+  - "data/settings.yaml"
+```
+
+在集合目录下按工作区路径镜像子目录结构存放。例如 `/Users/abc/project/src/config.json` 存储为 `<collection>/Users/abc/project/src/config.json`。
+
 ### Config 界面
 
 `M-x eon-workspace-config` 打开 widget 界面，可编辑：
@@ -181,7 +195,7 @@ action:
 | `eon-workspace-projects-file` | 已知项目列表文件路径 |
 | `eon-workspace-recent-file` | 最近使用顺序文件路径 |
 | `eon-workspace-config-file` | 配置文件名（默认 `.eon.yaml`） |
-| `eon-workspace-action-key` | action 子树的 YAML key 名（默认 `action`） |
+| `eon-workspace-collection-path` | 配置收集目录，nil 禁用；`.eon.yaml` 及 collection-files 通过硬连接汇集于此 |
 | `eon-workspace-action-default-key` | 默认 action 的 key 名（默认 `default`） |
 | `eon-workspace-fd-executable` | `fd` 可执行文件（默认 `fd`） |
 | `eon-workspace-open-dired-on-create` | 创建后是否打开 dired |
