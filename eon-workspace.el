@@ -418,7 +418,7 @@ MARK-OPEN 非 nil 时，对已打开项标注 〔已打开〕。"
   (eon-workspace--ensure-recent-loaded)
   (let ((d (eon-workspace--normalize-dir dir)))
     (setq eon-workspace--recent
-          (cons d (delq d eon-workspace--recent)))
+          (cons d (delete d eon-workspace--recent)))
     (eon-workspace--save-recent)))
 
 (defun eon-workspace--remember-project (dir)
@@ -1428,8 +1428,8 @@ Everything else in the file is preserved untouched."
            (completing-read "移除项目: " eon-workspace--projects nil t))))
   (eon-workspace--ensure-projects-loaded)
   (let ((d (eon-workspace--normalize-dir dir)))
-    (setq eon-workspace--projects (delq d eon-workspace--projects)
-          eon-workspace--recent (delq d eon-workspace--recent))
+    (setq eon-workspace--projects (delete d eon-workspace--projects)
+          eon-workspace--recent (delete d eon-workspace--recent))
     (eon-workspace--save-projects)
     (eon-workspace--save-recent)
     (message "已移除项目: %s" d)))
