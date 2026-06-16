@@ -59,6 +59,7 @@
 | `eon-workspace-list` | 列出所有 workspace |
 | `eon-workspace-add-project` | 将目录加入已知项目列表 |
 | `eon-workspace-remove-project` | 从已知项目列表移除目录 |
+| `eon-workspace-add-collection-file` | 将当前 buffer（或 dired 光标所在文件）加入 collection-files |
 | `eon-workspace-init-config` | 在 workspace 根目录创建 `.eon.yaml` 模板 |
 | `eon-workspace-config` | 编辑 `.eon.yaml`（ignore-patterns 与 action.default） |
 | `eon-workspace-action` | 从已配置的 action 中选择并执行 |

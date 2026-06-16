@@ -50,6 +50,7 @@
 ;;   M-x eon-workspace-list            列出所有 workspace
 ;;   M-x eon-workspace-add-project     手工把目录加入已知项目列表
 ;;   M-x eon-workspace-remove-project  从已知项目列表中移除
+;;   M-x eon-workspace-add-collection-file  将当前文件加入 collection-files
 ;;   M-x eon-workspace-init-config     在当前 workspace 根目录创建 .eon.yaml
 ;;   M-x eon-workspace-config           用 customize 风格界面编辑 .eon.yaml
 ;;   M-x eon-workspace-compile          执行 compile 命令（向后兼容，推荐 action.compile）
@@ -844,6 +845,39 @@ DEPTH 用于 heredoc 定界符编号，避免嵌套冲突。
   (let ((file (expand-file-name eon-workspace-config-file root)))
     (eon-workspace--parse-yaml-list file eon-workspace-collection-files-key)))
 
+(defun eon-workspace--yaml-append-list-item (file key item)
+  "在 FILE 的 YAML 顶层 KEY 列表末尾追加 ITEM（若尚未存在）。
+已存在时返回 nil 且不修改文件；成功追加返回 t。"
+  (with-temp-buffer
+    (insert-file-contents file)
+    (goto-char (point-min))
+    (let ((header (format "^%s:[ \t]*$" (regexp-quote key)))
+          modified)
+      (if (re-search-forward header nil t)
+          (let ((body-start (point)))
+            (forward-line 1)
+            (while (and (not (eobp))
+                        (or (looking-at-p "^[ \t]*-[ \t]+")
+                            (looking-at-p "^[ \t]*$")))
+              (forward-line 1))
+            (let ((body-end (point)))
+              (goto-char body-start)
+              (if (re-search-forward
+                   (concat "^[ \t]*-[ \t]+\""
+                           (regexp-quote item) "\"")
+                   body-end t)
+                  (setq modified nil)
+                (goto-char body-end)
+                (insert (format "  - \"%s\"\n" item))
+                (setq modified t))))
+        (goto-char (point-max))
+        (unless (bolp) (insert "\n"))
+        (insert (format "%s:\n  - \"%s\"\n" key item))
+        (setq modified t))
+      (when modified
+        (write-region nil nil file))
+      modified)))
+
 (defun eon-workspace--compile-command (root)
   "读取 ROOT 下 `eon-workspace-config-file' 配置的 compile 命令。
 注意：此顶层 key 已废弃，推荐使用 `eon-workspace--action-command'。"
@@ -1433,6 +1467,33 @@ Everything else in the file is preserved untouched."
     (eon-workspace--save-projects)
     (eon-workspace--save-recent)
     (message "已移除项目: %s" d)))
+
+;;;###autoload
+(defun eon-workspace-add-collection-file ()
+  "将当前 buffer 访问的文件加入当前工作区的 collection-files 列表。
+在 dired 中则取光标所在文件；否则取 `buffer-file-name'。
+文件路径相对于工作区根目录写入 .eon.yaml。"
+  (interactive)
+  (let ((ws (eon-workspace-current)))
+    (unless ws (user-error "当前 frame 未关联 workspace"))
+    (let* ((root (eon-workspace-root ws))
+           (target
+            (or (and (derived-mode-p 'dired-mode)
+                     (dired-get-filename))
+                (buffer-file-name))))
+      (unless target
+        (user-error "当前 buffer 无关联文件"))
+      (let ((rel (file-relative-name (expand-file-name target) root)))
+        (when (string-prefix-p ".." rel)
+          (user-error "文件不在当前工作区目录下: %s" target))
+        (let ((config-file (expand-file-name eon-workspace-config-file root)))
+          (unless (file-exists-p config-file)
+            (with-temp-file config-file
+              (insert "# eon-workspace 配置文件\n")))
+          (if (eon-workspace--yaml-append-list-item
+               config-file eon-workspace-collection-files-key rel)
+              (message "已添加 collection-file: %s" rel)
+            (message "文件已在 collection-files 列表中: %s" rel)))))))
 
 ;;;###autoload
 (defun eon-workspace-find-file ()
