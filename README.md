@@ -11,6 +11,7 @@
 - **项目内找文件**：`eon-workspace-find-file` 用 `fd` 列出文件，Ivy 选择（支持 `ivy-occur`），遵守 `.gitignore`，并叠加 `.eon.yaml` 忽略规则
 - **项目内搜索**：`eon-workspace-rg` 在当前 workspace 根目录执行 `counsel-rg`
 - **Action 系统**：在 `.eon.yaml` 中定义可复用的 shell 操作（编译、部署、同步等），支持本地执行与 SSH 远程执行
+- **标签**：每个 workspace 可打多个标签，从预设列表多选，持久化在 `eon-workspace-projects.el` 的 alist 中
 - **清理**：`eon-workspace-cleanup` 关闭当前 workspace 中位于根目录之外的文件 buffer
 - **配置收集**：`eon-workspace-collect-config` 将所有工作区的 `.eon.yaml` 及 `collection-files` 中列出的文件通过硬连接汇集到统一目录，双向同步、互为备份
 
@@ -60,6 +61,8 @@
 | `eon-workspace-add-project` | 将目录加入已知项目列表 |
 | `eon-workspace-remove-project` | 从已知项目列表移除目录 |
 | `eon-workspace-add-collection-file` | 将当前 buffer（或 dired 光标所在文件）加入 collection-files |
+| `eon-workspace-tag` | 设置当前工作区标签（从预设列表多选） |
+| `eon-workspace-get-tags` | 获取当前工作区标签列表 |
 | `eon-workspace-init-config` | 在 workspace 根目录创建 `.eon.yaml` 模板 |
 | `eon-workspace-config` | 编辑 `.eon.yaml`（ignore-patterns 与 action.default） |
 | `eon-workspace-action` | 从已配置的 action 中选择并执行 |
@@ -75,7 +78,7 @@
 
 | 文件 | 作用 |
 |------|------|
-| `eon-workspace-projects.el` | 已知项目固定集合，仅 `add-project` / `remove-project` 增删，顺序稳定 |
+| `eon-workspace-projects.el` | 已知项目 alist `((ROOT . TAG...) ...)`，`add-project` / `remove-project` 增删项目，`eon-workspace-tag` 变更标签，顺序稳定 |
 | `eon-workspace-recent.el` | F8 列表的 MRU 顺序，每次切换/创建 workspace 时更新；已打开项优先排前 |
 
 加载 `projects` 时会自动去重并写回。首次无 `recent` 文件时，用当前 `projects` 顺序初始化。
@@ -181,6 +184,18 @@ collection-files:
 
 若 `eon-workspace-collection-path` 位于 git 仓库内，`eon-workspace-collect-config` 在同步完成后会自动以当前时间（精确到秒）为提交信息执行 `git add -A` + `git commit`，实现配置变更的自动版本记录。
 
+### 标签
+
+`M-x eon-workspace-tag` 为当前工作区设置标签，从 `eon-workspace-tag-presets` 预设列表中多选。标签持久化在 `eon-workspace-projects.el`，与项目列表共同存储为 `((ROOT . TAG...) ...)` 格式的 alist。
+
+`M-x eon-workspace-get-tags` 获取当前工作区标签。`M-x eon-workspace-list` 的列表视图会显示标签列。
+
+```elisp
+;; 预设可用标签
+(setq eon-workspace-tag-presets
+      '("frontend" "backend" "devops" "tools" "data"))
+```
+
 ### Config 界面
 
 `M-x eon-workspace-config` 打开 widget 界面，可编辑：
@@ -203,6 +218,7 @@ collection-files:
 | `eon-workspace-fd-executable` | `fd` 可执行文件（默认 `fd`） |
 | `eon-workspace-open-dired-on-create` | 创建后是否打开 dired |
 | `eon-workspace-confirm-kill` | 删除 workspace 前是否确认 |
+| `eon-workspace-tag-presets` | 可选标签预设列表 |
 
 完整选项：`M-x customize-group RET eon-workspace RET`
 
