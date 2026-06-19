@@ -343,16 +343,25 @@ MARK-OPEN 非 nil 时，对已打开项标注 〔已打开〕。"
   (eon-workspace--ensure-projects-loaded)
   (cdr (eon-workspace--project-entry root)))
 
+(defun eon-workspace--valid-tag-p (tag)
+  "TAG 是否为合法标签值（非展示字符串、非 propertized）。"
+  (and (stringp tag)
+       (not (string-empty-p tag))
+       ;; 过滤 ivy 展示字符串：未选中时带 "  " 前缀，选中时带 "✓ " 前缀和 face property
+       (not (string-prefix-p "  " tag))
+       (not (string-prefix-p "✓ " tag))))
+
+(defun eon-workspace--sanitize-tags (tags)
+  "从 TAGS 中过滤掉非法标签值，返回干净的标签列表。"
+  (seq-filter #'eon-workspace--valid-tag-p tags))
+
 (defun eon-workspace--tags-set (root tags)
   "设置 ROOT 的标签列表为 TAGS（nil 表示删除标签），写回 projects 文件。"
   (eon-workspace--ensure-projects-loaded)
   (let ((dir (eon-workspace--normalize-dir root)))
     (setq eon-workspace--projects
           (assoc-delete-all dir eon-workspace--projects))
-    (push (cons dir (seq-filter (lambda (tag)
-                                  (and (stringp tag)
-                                       (not (string-empty-p tag))))
-                                tags))
+    (push (cons dir (eon-workspace--sanitize-tags tags))
           eon-workspace--projects)
     (eon-workspace--save-projects)))
 
@@ -418,13 +427,20 @@ MARK-OPEN 非 nil 时，对已打开项标注 〔已打开〕。"
     (setq eon-workspace--projects-loaded t)
     eon-workspace--projects))
 
+(defun eon-workspace--sanitize-project-alist (alist)
+  "清理 alist 中各条目的标签列表，剔除展示字符串等非法标签值。"
+  (mapcar (lambda (entry)
+            (cons (car entry) (eon-workspace--sanitize-tags (cdr entry))))
+          alist))
+
 (defun eon-workspace--ensure-projects-loaded ()
-  "加载项目 alist，并保证内存中去重。"
+  "加载项目 alist，并保证内存中去重且标签值合法。"
   (unless eon-workspace--projects-loaded
     (eon-workspace--load-projects))
-  (let ((deduped (eon-workspace--dedupe-project-alist eon-workspace--projects)))
-    (unless (equal deduped eon-workspace--projects)
-      (setq eon-workspace--projects deduped)
+  (let ((cleaned (eon-workspace--sanitize-project-alist
+                  (eon-workspace--dedupe-project-alist eon-workspace--projects))))
+    (unless (equal cleaned eon-workspace--projects)
+      (setq eon-workspace--projects cleaned)
       (eon-workspace--save-projects))))
 
 (defun eon-workspace--save-projects ()
@@ -1581,10 +1597,7 @@ Everything else in the file is preserved untouched."
            (current-tags (or (eon-workspace--tags-get root)))
            (selected (copy-sequence current-tags)))
       (cl-labels ((pick ()
-                    (let ((choice
-                           (ivy-read
-                            (format "标签 (%s，RET 切换，C-g 完成): "
-                                    (eon-workspace-name ws))
+                    (let* ((cands
                             (mapcar (lambda (tag)
                                       (cons (if (member tag selected)
                                                 (propertize
@@ -1592,12 +1605,20 @@ Everything else in the file is preserved untouched."
                                                  'face 'font-lock-keyword-face)
                                               (concat "  " tag))
                                             tag))
-                                    eon-workspace-tag-presets)
-                            :caller 'eon-workspace-tag)))
+                                    eon-workspace-tag-presets))
+                           (choice
+                            (ivy-read
+                             (format "标签 (%s，RET 切换，C-g 完成): "
+                                     (eon-workspace-name ws))
+                             cands
+                             :caller 'eon-workspace-tag)))
                       (when choice
-                        (if (member choice selected)
-                            (setq selected (delete choice selected))
-                          (push choice selected))
+                        (let ((tag (cdr (cl-find choice cands
+                                                 :key #'car
+                                                 :test #'string=))))
+                          (if (member tag selected)
+                              (setq selected (delete tag selected))
+                            (push tag selected)))
                         (pick)))))
         (condition-case nil (pick) (quit nil))
         (eon-workspace--tags-set root selected)
