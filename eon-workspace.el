@@ -23,7 +23,8 @@
 ;;   - eon-workspace-find-file 通过 fd 列出 ROOT 下文件，ivy 补全选择
 ;;     （支持 ivy-occur 等 ivy-read 能力），
 ;;     遵守 .gitignore，并叠加 ROOT/.eon.yaml 中
-;;     ignore-patterns: 配置的额外过滤模式
+;;     ignore-patterns: 配置的额外过滤模式，
+;;     同时 collection-files: 列表中的文件会被强制纳入候选
 ;;   - 每个 workspace 可打多个标签，标签从 `eon-workspace-tag-presets'
 ;;     预设列表中选取，持久化在 eon-workspace-projects.el 的 alist 中
 ;;   - 提供清理命令，清理当前 workspace 中非工作目录文件对应的 buffer，
@@ -34,6 +35,8 @@
 ;;   ignore-patterns:
 ;;     - "*.log"
 ;;     - "dist"
+;;   collection-files:
+;;     - "src/generated.rs"
 ;;   action:
 ;;     default: compile
 ;;     compile: |
@@ -999,7 +1002,9 @@ DEPTH 用于 heredoc 定界符编号，避免嵌套冲突。
 
 (defun eon-workspace--list-project-files (root)
   "用 fd 列出 ROOT 下文件，按 .eon.yaml ignore-patterns 过滤。
-返回相对 ROOT 的路径字符串列表。"
+随后叠加 .eon.yaml 中 collection-files 列表：这些文件即使被
+.gitignore 或 ignore-patterns 排除也会被强制纳入候选。
+返回相对 ROOT 的路径字符串列表，去重后保留 fd 结果顺序。"
   (unless (executable-find eon-workspace-fd-executable)
     (user-error "找不到可执行文件: %s" eon-workspace-fd-executable))
   (let* ((patterns (eon-workspace--ignore-patterns root))
@@ -1012,7 +1017,24 @@ DEPTH 用于 heredoc 定界符编号，避免嵌套冲突。
         (unless (zerop exit)
           (user-error "fd 执行失败 (exit %s): %s"
                       exit (string-trim (buffer-string))))
-        (split-string (buffer-string) "\0" t)))))
+        (let ((fd-files (split-string (buffer-string) "\0" t))
+              ;; collection-files 列表，隐式追加 .eon.yaml 自身
+              (collected (cons eon-workspace-config-file
+                               (eon-workspace--collection-files root))))
+          ;; 合并 collection-files：仅保留实际存在的文件，去重
+          (let ((seen (make-hash-table :test 'equal))
+                (result nil))
+            (dolist (f fd-files)
+              (unless (gethash f seen)
+                (puthash f t seen)
+                (push f result)))
+            (dolist (f collected)
+              (let ((rel (file-relative-name (expand-file-name f root) root)))
+                (when (and (file-exists-p (expand-file-name rel root))
+                           (not (gethash rel seen)))
+                  (puthash rel t seen)
+                  (push rel result))))
+            (nreverse result)))))))
 
 (defun eon-workspace--record-buffer (ws buf)
   "把 BUF 登记到 WS 的私有 buffer 列表（最近访问者在前）。"
@@ -1222,6 +1244,13 @@ ROOT 是工作目录；NAME 是 workspace 名称，缺省由 ROOT 生成。
           (insert (format "%s:\n" eon-workspace-ignore-patterns-key))
           (insert "  - \".git\"\n")
           (insert "\n")
+          (insert "# collection-files: 强制纳入 eon-workspace-find-file 候选的文件列表。\n")
+          (insert "# 即使文件被 .gitignore 或 ignore-patterns 排除，也会被强制收集。\n")
+          (insert "# 路径相对于工作区根目录。可通过 M-x eon-workspace-add-collection-file 添加。\n\n")
+          (insert (format "%s:\n" eon-workspace-collection-files-key))
+          (insert "  # - \"src/generated.rs\"\n")
+          (insert "  # - \"config/local.yaml\"\n")
+          (insert "\n")
           (insert "# action: 可自由配置的操作命令。每个子 key 对应一个 shell 命令。\n")
           (insert "# default: 指定默认执行的 action 名称（可选），通过 `M-x eon-workspace-action-default' 执行。\n")
           (insert "# 执行时以 workspace 根目录作为工作目录。\n")
@@ -1347,13 +1376,17 @@ ROOT 是工作目录；NAME 是 workspace 名称，缺省由 ROOT 生成。
 (defvar-local eon-workspace-config--default-widget nil
   "Buffer-local reference to the default action text widget.")
 
+(defvar-local eon-workspace-config--collection-widget nil
+  "Buffer-local reference to the collection-files editable-list widget.")
+
 (defvar-local eon-workspace-config--config-file nil
   "Buffer-local path to the .eon.yaml being edited.")
 
-(defun eon-workspace-config--write-yaml (file patterns default-action)
-  "Update FILE: replace ignore-patterns and action.default lines.
+(defun eon-workspace-config--write-yaml (file patterns default-action collection-files)
+  "Update FILE: replace ignore-patterns, collection-files and action.default lines.
 Everything else in the file is preserved untouched."
-  (let ((filtered (seq-remove #'string-empty-p patterns)))
+  (let ((filtered (seq-remove #'string-empty-p patterns))
+        (col-filtered (seq-remove #'string-empty-p collection-files)))
     (with-temp-buffer
       (insert-file-contents file)
       ;; Replace ignore-patterns block
@@ -1365,6 +1398,16 @@ Everything else in the file is preserved untouched."
         (if filtered
             (dolist (p filtered)
               (insert (format "  - \"%s\"\n" p)))
+          (insert "  []\n")))
+      ;; Replace collection-files block
+      (goto-char (point-min))
+      (when (re-search-forward (format "^%s:" (regexp-quote eon-workspace-collection-files-key)) nil t)
+        (forward-line 1)
+        (while (and (not (eobp)) (looking-at "^[ \t]+"))
+          (delete-region (line-beginning-position) (line-beginning-position 2)))
+        (if col-filtered
+            (dolist (c col-filtered)
+              (insert (format "  - \"%s\"\n" c)))
           (insert "  []\n")))
       ;; Update/add action.default
       (goto-char (point-min))
@@ -1395,9 +1438,12 @@ Everything else in the file is preserved untouched."
   (if eon-workspace-config--editable-list
       (let ((patterns (widget-value eon-workspace-config--editable-list))
             (default-action (when eon-workspace-config--default-widget
-                              (widget-value eon-workspace-config--default-widget))))
+                              (widget-value eon-workspace-config--default-widget)))
+            (collection-files (when eon-workspace-config--collection-widget
+                                (widget-value eon-workspace-config--collection-widget))))
         (eon-workspace-config--write-yaml eon-workspace-config--config-file
-                                          patterns default-action)
+                                          patterns default-action
+                                          (or collection-files '()))
         (eon-workspace--ensure-action-commands)
         (message "已保存到 %s" eon-workspace-config--config-file))
     (user-error "找不到配置 widget")))
@@ -1430,6 +1476,7 @@ Everything else in the file is preserved untouched."
   "Populate BUF with widgets for ROOT's .eon.yaml."
   (let* ((config-file (expand-file-name eon-workspace-config-file root))
          (patterns (eon-workspace--ignore-patterns root))
+         (collection-files (eon-workspace--collection-files root))
          (default-action (eon-workspace--action-default-name root))
          (actions (eon-workspace--action-map root)))
     (with-current-buffer buf
@@ -1438,6 +1485,7 @@ Everything else in the file is preserved untouched."
       (remove-overlays)
       (setq eon-workspace-config--editable-list nil)
       (setq eon-workspace-config--default-widget nil)
+      (setq eon-workspace-config--collection-widget nil)
       (setq eon-workspace-config--config-file config-file)
       (widget-insert (propertize
                       (format "配置文件: %s\n\n" config-file)
@@ -1456,6 +1504,23 @@ Everything else in the file is preserved untouched."
              :delete-button-args '(:tag "删除")
              :append-button-args '(:tag "新增")
              :value (or patterns '())
+             :indent 2
+             '(editable-field :format "%v")))
+      (widget-insert "\n")
+      ;; --- collection-files (editable) ---
+      (widget-insert (propertize
+                      (format "%s:\n" eon-workspace-collection-files-key)
+                      'face 'widget-documentation-face))
+      (widget-insert
+       "  强制纳入 find-file 候选的文件列表（即使被 gitignore/ignore-patterns 排除）。\n\n")
+      (setq eon-workspace-config--collection-widget
+            (widget-create
+             'editable-list
+             :entry-format "%i %d %v"
+             :insert-button-args '(:tag "新增")
+             :delete-button-args '(:tag "删除")
+             :append-button-args '(:tag "新增")
+             :value (or collection-files '())
              :indent 2
              '(editable-field :format "%v")))
       (widget-insert "\n")
