@@ -1060,7 +1060,7 @@ DEPTH 用于 heredoc 定界符编号，避免嵌套冲突。
 (defun eon-workspace-buffer-list (&optional ws)
   "返回 WS（默认为当前 frame 所属 workspace）的私有 buffer 列表，
 仅返回仍然存活的 buffer。"
-  (when-let ((ws (or ws (eon-workspace-current))))
+  (when-let* ((ws (or ws (eon-workspace-current))))
     (let ((live (seq-filter #'buffer-live-p (eon-workspace-buffers ws))))
       (setf (eon-workspace-buffers ws) live)
       live)))
@@ -1324,7 +1324,7 @@ ROOT 是工作目录；NAME 是 workspace 名称，缺省由 ROOT 生成。
 (defun eon-workspace--ensure-action-commands (&optional root)
   "确保当前 workspace 的 action 都有对应的 `eon-workspace-action-<name>' 命令。
 可选参数 ROOT 指定 workspace 根目录；未提供时自动取当前 workspace。"
-  (let* ((root (or root (when-let ((ws (eon-workspace-current)))
+  (let* ((root (or root (when-let* ((ws (eon-workspace-current)))
                           (eon-workspace-root ws))))
          (actions (when root (eon-workspace--action-map root))))
     (dolist (action actions)
@@ -1570,13 +1570,13 @@ ROOT 是工作目录；NAME 是 workspace 名称，缺省由 ROOT 生成。
 
 (defun eon-workspace--buffer-list-collection (str &optional predicate _action)
   "Ivy/`all-completions' 用的 collection，只返回当前 workspace 存活 buffer 的名称。"
-  (when-let ((names (eon-workspace--buffer-name-list)))
+  (when-let* ((names (eon-workspace--buffer-name-list)))
     (all-completions str (lambda (_s &rest _) names) predicate)))
 
 (defun eon-workspace--ivy-kill-buffer-action (name)
   "Kill 名为 NAME 的 buffer，并刷新 workspace 候选列表。"
   (when (and name (not (string-empty-p name)))
-    (when-let ((buf (get-buffer name)))
+    (when-let* ((buf (get-buffer name)))
       (kill-buffer buf)))
   (unless (buffer-live-p (ivy-state-buffer ivy-last))
     (setf (ivy-state-buffer ivy-last)
@@ -1654,7 +1654,7 @@ ROOT 为工作目录绝对路径；交互选择与 `eon-workspace-create' 相同
 (defun eon-workspace--save-buffers-kill-terminal (orig-fun &rest args)
   "拦截 `save-buffers-kill-terminal'：若当前 frame 有 workspace，则仅删除该 workspace。
 若无 workspace 则正常退出 Emacs。"
-  (if-let ((ws (eon-workspace-current)))
+  (if-let* ((ws (eon-workspace-current)))
       (let ((eon-workspace-confirm-kill nil))
         (eon-workspace-kill (eon-workspace-root ws)))
     (apply orig-fun args)))
@@ -1783,7 +1783,7 @@ collection-files 列表所列文件各建立硬连接，实现双向同步：
   "FRAME 被删除时同步移除对应 workspace，并尽力 kill 其私有 buffer。
 此路径不可取消 delete-frame；在 emacs 退出过程中跳过 buffer 处理，
 避免与 `save-buffers-kill-emacs' 的统一提示重复。"
-  (when-let ((ws (eon-workspace--find-by-frame frame)))
+  (when-let* ((ws (eon-workspace--find-by-frame frame)))
     (unless (or noninteractive
                 (memq this-command
                       '(save-buffers-kill-emacs

@@ -29,7 +29,7 @@
   "LINES 中非空行的最小行首缩进。"
   (let ((min nil))
     (dolist (l lines)
-      (when-let ((ind (eon-workspace--line-leading-indent l)))
+      (when-let* ((ind (eon-workspace--line-leading-indent l)))
         (setq min (if min (min min ind) ind))))
     min))
 
@@ -69,7 +69,7 @@
                           (setq found t))
                       (progn
                         (push bl body-lines)
-                        (when-let ((ind (eon-workspace--line-leading-indent bl)))
+                        (when-let* ((ind (eon-workspace--line-leading-indent bl)))
                           (setq body-content-indent
                                 (if body-content-indent
                                     (min body-content-indent ind)
