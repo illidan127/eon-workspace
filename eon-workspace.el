@@ -24,7 +24,8 @@
 ;;     （支持 ivy-occur 等 ivy-read 能力），
 ;;     遵守 .gitignore，并叠加 ROOT/.eon.yaml 中
 ;;     ignore-patterns: 配置的额外过滤模式，
-;;     同时 collection-files: 列表中的文件会被强制纳入候选
+;;     同时 collection-files: 列表中的文件会被强制纳入候选，
+;;     relevant-path: 列出大仓中需参与查找/搜索的子目录
 ;;   - 每个 workspace 可打多个标签，标签从 `eon-workspace-tag-presets'
 ;;     预设列表中选取，持久化在 eon-workspace-projects.el 的 alist 中
 ;;   - 提供清理命令，清理当前 workspace 中非工作目录文件对应的 buffer，
@@ -37,6 +38,9 @@
 ;;     - "dist"
 ;;   collection-files:
 ;;     - "src/generated.rs"
+;;   relevant-path:
+;;     - "packages/app-a"
+;;     - "libs"
 ;;   action:
 ;;     default: compile
 ;;     compile: |
@@ -113,11 +117,20 @@ eon-workspace-recent.el。"
 (defconst eon-workspace-ignore-patterns-key "ignore-patterns"
   ".eon.yaml 中表示忽略模式列表的顶层 key 名。")
 
+(defconst eon-workspace-rg-ignore-patterns-key "rg-ignore-patterns"
+  ".eon.yaml 中表示仅在 rg 搜索时排除的模式列表的顶层 key 名。
+不影响 `eon-workspace-find-file' 的候选文件。")
+
 (defconst eon-workspace-action-key "action"
   ".eon.yaml 中表示 action 子树的顶层 key 名。")
 
 (defconst eon-workspace-collection-files-key "collection-files"
   ".eon.yaml 中表示需纳入配置收集的文件列表的顶层 key 名。")
+
+(defconst eon-workspace-relevant-path-key "relevant-path"
+  ".eon.yaml 中表示大仓相关目录列表的顶层 key 名。
+配置后 `eon-workspace-find-file' 与 `eon-workspace-rg' 仅在这些
+子目录内工作（大仓场景）。路径相对于工作区根目录。")
 
 (defcustom eon-workspace-tag-presets
   '("frontend" "backend" "devops" "tools" "data")
@@ -917,6 +930,35 @@ DEPTH 用于 heredoc 定界符编号，避免嵌套冲突。
   (let ((file (expand-file-name eon-workspace-config-file root)))
     (eon-workspace--parse-yaml-list file eon-workspace-collection-files-key)))
 
+(defun eon-workspace--rg-ignore-patterns (root)
+  "读取 ROOT 下 .eon.yaml 中 rg-ignore-patterns 列表。
+仅用于 rg 搜索，不影响 `eon-workspace-find-file'。"
+  (let ((file (expand-file-name eon-workspace-config-file root)))
+    (eon-workspace--parse-yaml-list file eon-workspace-rg-ignore-patterns-key)))
+
+(defun eon-workspace--relevant-paths (root)
+  "读取 ROOT 下 .eon.yaml 中 relevant-path 列表。
+返回相对于工作区根目录的目录路径列表；未配置时返回 nil。"
+  (let ((file (expand-file-name eon-workspace-config-file root)))
+    (eon-workspace--parse-yaml-list file eon-workspace-relevant-path-key)))
+
+(defun eon-workspace--relevant-dirs (root)
+  "返回 ROOT 下 relevant-path 中实际存在的目录（相对路径）。
+配置了但全部无效时提示并返回 nil。"
+  (let* ((paths (eon-workspace--relevant-paths root))
+         (dirs (seq-filter (lambda (p)
+                             (file-directory-p (expand-file-name p root)))
+                           paths)))
+    (when (and paths (null dirs))
+      (message "relevant-path 中无有效目录，回退到整个工作区"))
+    dirs))
+
+(defun eon-workspace--fd-search-args (root)
+  "返回 fd 的 pattern 与搜索路径参数。
+配置了 relevant-path 时仅搜索其中的子目录，否则搜索整个工作区。"
+  (let ((dirs (eon-workspace--relevant-dirs root)))
+    (if dirs (cons "." dirs) '("."))))
+
 (defun eon-workspace--yaml-append-list-item (file key item)
   "在 FILE 的 YAML 顶层 KEY 列表末尾追加 ITEM（若尚未存在）。
 已存在时返回 nil 且不修改文件；成功追加返回 t。"
@@ -992,15 +1034,22 @@ DEPTH 用于 heredoc 定界符编号，避免嵌套冲突。
               (when (re-search-forward default-re nil t)
                 (string-trim (match-string 1))))))))))
 
-(defun eon-workspace--rg-ignored-globs (root)
-  "从 ROOT 的 .eon.yaml ignore-patterns 生成 rg 的 --glob ! 参数串。"
-  (mapconcat (lambda (p)
-               (concat "--glob !" (shell-quote-argument p)))
-             (eon-workspace--ignore-patterns root)
-             " "))
+(defun eon-workspace--rg-extra-args (root)
+  "返回 rg 的额外 --glob 参数列表（未做 shell 转义）。
+relevant-path 转为包含规则，ignore-patterns 与 rg-ignore-patterns
+转为排除规则。rg 中后出现的 glob 优先，因此包含规则必须放在
+排除规则之前，否则包含规则会把排除规则覆盖掉。包含规则前置 **/ ，
+因为 rg 对绝对路径（含 macOS symlink 解析后的路径）不会用子目录
+路径前缀去匹配 glob。"
+  (append (cl-mapcan (lambda (p) (list "--glob" (concat "**/" p "/**")))
+                     (eon-workspace--relevant-dirs root))
+          (cl-mapcan (lambda (p) (list "--glob" (concat "!" p)))
+                     (append (eon-workspace--ignore-patterns root)
+                             (eon-workspace--rg-ignore-patterns root)))))
 
 (defun eon-workspace--list-project-files (root)
   "用 fd 列出 ROOT 下文件，按 .eon.yaml ignore-patterns 过滤。
+配置了 relevant-path 时仅在其子目录中搜索（大仓场景）。
 随后叠加 .eon.yaml 中 collection-files 列表：这些文件即使被
 .gitignore 或 ignore-patterns 排除也会被强制纳入候选。
 返回相对 ROOT 的路径字符串列表，去重后保留 fd 结果顺序。"
@@ -1009,7 +1058,14 @@ DEPTH 用于 heredoc 定界符编号，避免嵌套冲突。
   (let* ((patterns (eon-workspace--ignore-patterns root))
          (ignore-args (cl-mapcan (lambda (p) (list "-E" p)) patterns))
          (default-directory root)
-         (args (append eon-workspace-fd-args ignore-args (list "."))))
+         (search-args (eon-workspace--fd-search-args root))
+         ;; --strip-cwd-prefix 不能与显式 path 参数共存，且带 path 时
+         ;; fd 输出本来就相对 cwd
+         (base (if (cdr search-args)
+                   (seq-remove (lambda (a) (string= a "--strip-cwd-prefix"))
+                               eon-workspace-fd-args)
+                 eon-workspace-fd-args))
+         (args (append base ignore-args search-args)))
     (with-temp-buffer
       (let ((exit (apply #'call-process
                          eon-workspace-fd-executable nil t nil args)))
@@ -1242,6 +1298,17 @@ ROOT 是工作目录；NAME 是 workspace 名称，缺省由 ROOT 生成。
           (insert "# 过滤 eon-workspace-find-file 的候选文件。\n\n")
           (insert (format "%s:\n" eon-workspace-ignore-patterns-key))
           (insert "  - \".git\"\n")
+          (insert "\n")
+          (insert "# rg-ignore-patterns: 仅 `eon-workspace-rg' 搜索时排除的模式，\n")
+          (insert "# 不影响 find-file 候选（例如 \"*_test.go\"）。\n")
+          (insert (format "%s:\n" eon-workspace-rg-ignore-patterns-key))
+          (insert "  # - \"*_test.go\"\n")
+          (insert "\n")
+          (insert "# relevant-path: 大仓相关目录列表。配置后 find-file/rg 仅在这些子目录内工作。\n")
+          (insert "# 路径相对于工作区根目录，留空或不配置表示整个工作区。\n")
+          (insert (format "%s:\n" eon-workspace-relevant-path-key))
+          (insert "  # - \"packages/app-a\"\n")
+          (insert "  # - \"libs\"\n")
           (insert "\n")
           (insert "# collection-files: 强制纳入 eon-workspace-find-file 候选的文件列表。\n")
           (insert "# 即使文件被 .gitignore 或 ignore-patterns 排除，也会被强制收集。\n")
@@ -1523,17 +1590,21 @@ ROOT 是工作目录；NAME 是 workspace 名称，缺省由 ROOT 生成。
 ;;;###autoload
 (defun eon-workspace-rg (&optional options)
   "在当前 workspace ROOT 中用 rg 搜索，行为类似 `counsel-projectile-rg'。
-忽略规则来自 ROOT/.eon.yaml 的 ignore-patterns（转为 rg --glob !）。
+忽略规则来自 ROOT/.eon.yaml 的 ignore-patterns（转为 rg --glob !），
+配置了 relevant-path 时再叠加 --glob 包含规则。
 \\[universal-argument] 前缀参数时额外读取 rg 选项。"
   (interactive)
   (let ((ws (eon-workspace-current)))
     (unless ws (user-error "当前 frame 未关联 workspace"))
     (require 'counsel)
     (let* ((root (eon-workspace-root ws))
-           (ignored (eon-workspace--rg-ignored-globs root))
+           ;; 参数按列表传递（不经 shell），直接追加；字符串形式才需要转义
+           (extra (eon-workspace--rg-extra-args root))
            (counsel-rg-base-command
-            (let ((counsel-ag-command counsel-rg-base-command))
-              (counsel--format-ag-command ignored "%s")))
+            (if (listp counsel-rg-base-command)
+                (append counsel-rg-base-command extra)
+              (concat counsel-rg-base-command " "
+                      (mapconcat #'shell-quote-argument extra " "))))
            (prompt-prefix (format "%s rg: " (eon-workspace-name ws))))
       ;; counsel-rg 用 C-u C-u 提示额外选项；此处把单次 C-u 映射过去
       (when (= (prefix-numeric-value current-prefix-arg) 4)

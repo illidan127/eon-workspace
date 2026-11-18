@@ -8,7 +8,7 @@
 - **固定根目录**：创建时绑定 `root`，之后不可修改
 - **创建即切换**：`eon-workspace-create` 从已知项目列表选择（已打开的工作区优先排在前面，均按最近使用排序）；已打开则切换 frame，未打开则新建
 - **Buffer 隔离**：`eon-workspace-buffer-isolation-mode` 通过 `buffer-predicate` 与 `read-buffer-function` 限制各 workspace 可见 buffer
-- **项目内找文件**：`eon-workspace-find-file` 用 `fd` 列出文件，Ivy 选择（支持 `ivy-occur`），遵守 `.gitignore`，并叠加 `.eon.yaml` 忽略规则
+- **项目内找文件**：`eon-workspace-find-file` 用 `fd` 列出文件，Ivy 选择（支持 `ivy-occur`），遵守 `.gitignore`，并叠加 `.eon.yaml` 忽略规则；`relevant-path` 可把范围限定到大仓中的若干子目录
 - **项目内搜索**：`eon-workspace-rg` 在当前 workspace 根目录执行 `counsel-rg`
 - **Action 系统**：在 `.eon.yaml` 中定义可复用的 shell 操作（编译、部署、同步等），支持本地执行与 SSH 远程执行
 - **标签**：每个 workspace 可打多个标签，从预设列表多选，持久化在 `eon-workspace-projects.el` 的 alist 中
@@ -102,6 +102,29 @@ ignore-patterns:
 ```
 
 模式会作为 `fd -E` 和 `rg --glob !` 参数叠加到 `.gitignore` 之上。
+
+### rg 专属排除（rg-ignore-patterns）
+
+只想在搜索时排除、但找文件时仍要看到（例如 Go 的 `*_test.go`）：
+
+```yaml
+rg-ignore-patterns:
+  - "*_test.go"
+```
+
+该列表仅作用于 `eon-workspace-rg`（转为 `rg --glob !模式`），不影响 `eon-workspace-find-file` 的候选文件。
+
+### 大仓相关目录（relevant-path）
+
+大仓中只想在若干子目录里找文件 / 搜索时，配置 `relevant-path`（相对工作区根目录）：
+
+```yaml
+relevant-path:
+  - "packages/app-a"
+  - "libs"
+```
+
+配置后 `eon-workspace-find-file`、`eon-workspace-open` 只在 `fd` 中传入这些目录，`eon-workspace-rg` 追加对应的 `--glob '**/DIR/**'`（前置 `**/` 以兼容绝对路径与符号链接解析后的路径）。不配置或所列目录都不存在时，回退为整个工作区。
 
 ### Action 系统
 
